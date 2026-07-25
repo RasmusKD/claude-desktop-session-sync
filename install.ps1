@@ -1,9 +1,9 @@
 # Installs the ClaudeChatSync scheduled task (per-user, no admin required).
-#  - copies the sync script to %LOCALAPPDATA%\ClaudeChatSync (the repo clone stays
-#    a repo; git pull can never silently change what the task executes)
-#  - takes a one-time zip backup of the session folders before the first sync
-#  - registers hardened triggers/settings (battery-safe, reboot-safe)
-#  - refuses to touch a scheduled task it does not recognize as its own
+# Order matters: the backup gate runs BEFORE the new engine is copied into place,
+# so a failed backup really does mean nothing changed. Backups are staged per
+# root (the roots share a leaf name and would collide inside one zip), the very
+# first snapshot is preserved outside the rotation, and a version-read failure
+# aborts instead of silently disabling upgrade backups.
 param([switch]$Force)
 $ErrorActionPreference = 'Stop'
 . "$PSScriptRoot\common.ps1"
@@ -16,14 +16,12 @@ function Get-ToolVersion($path) {
     if ($m) { $m.Matches[0].Groups[1].Value } else { '' }
 }
 
-# ── Payload to a stable, user-private location ───────────────────────────────
 New-Item -ItemType Directory -Force -Path $SyncInstallDir | Out-Null
 $installedVer = if (Test-Path $SyncScriptInstalled) { Get-ToolVersion $SyncScriptInstalled } else { '' }
 $srcVer = Get-ToolVersion $srcScript
-Copy-Item $srcScript -Destination $SyncScriptInstalled -Force
+if (-not $srcVer) { throw 'Could not read $ToolVersion from the source script; refusing to install.' }
 
-# ── Backup on first install AND on every version change: the users upgrading
-#    into new behavior are exactly the ones who need a fresh snapshot. ───────
+# ── Backup gate: first install AND every version change, BEFORE anything changes
 $existingBackup = Get-ChildItem -Path $SyncInstallDir -Filter 'backup-*.zip' -ErrorAction SilentlyContinue
 $backupRoots = @(
     (Join-Path $env:APPDATA 'Claude\claude-code-sessions'),
@@ -32,24 +30,41 @@ $backupRoots = @(
 $needBackup = (-not $existingBackup) -or ($installedVer -ne $srcVer)
 if ($needBackup -and @($backupRoots).Count -gt 0) {
     $zip = Join-Path $SyncInstallDir "backup-$(Get-Date -Format 'yyyyMMdd-HHmmss').zip"
+    $stage = Join-Path $env:TEMP "ccs-backup-$(Get-Date -Format 'yyyyMMddHHmmss')"
     try {
-        Compress-Archive -Path $backupRoots -DestinationPath $zip -ErrorAction Stop
+        # Stage per root: both roots end in 'claude-code-sessions', so zipping them
+        # directly would collide; staging also survives one locked file.
+        $i = 0
+        foreach ($r in $backupRoots) {
+            $i++
+            $dest = Join-Path $stage "root$i-$(Split-Path (Split-Path $r -Parent) -Leaf)"
+            New-Item -ItemType Directory -Force -Path $dest | Out-Null
+            Copy-Item -Path (Join-Path $r '*') -Destination $dest -Recurse -Force -ErrorAction Continue
+        }
+        Compress-Archive -Path (Join-Path $stage '*') -DestinationPath $zip -ErrorAction Stop
         Write-Host "Pre-sync backup written: $zip" -ForegroundColor Green
+        # The pristine first snapshot never rotates away.
+        $original = Join-Path $SyncInstallDir 'backup-original.zip'
+        if (-not (Test-Path $original)) { Copy-Item $zip $original -Force }
         Get-ChildItem -Path $SyncInstallDir -Filter 'backup-*.zip' -File |
+            Where-Object { $_.Name -ne 'backup-original.zip' } |
             Sort-Object Name -Descending | Select-Object -Skip 3 |
             Remove-Item -Force -ErrorAction SilentlyContinue
     } catch {
-        if (-not $Force) { throw "Backup failed ($($_.Exception.Message)). Refusing to install a tool that propagates deletions without a snapshot. Re-run with -Force to override." }
+        if (-not $Force) { throw "Backup failed ($($_.Exception.Message)). Nothing was installed or replaced; the previous version (if any) is still running. Re-run with -Force to override." }
         Write-Host "Backup failed ($($_.Exception.Message)) - continuing because -Force was given." -ForegroundColor Yellow
+    } finally {
+        Remove-Item $stage -Recurse -Force -ErrorAction SilentlyContinue
     }
 }
 
+# ── Payload goes live only after the backup gate ─────────────────────────────
+Copy-Item $srcScript -Destination $SyncScriptInstalled -Force
+
 # ── Launcher: path arrives as a task argument (task XML is UTF-16), so any
 #    username - including non-ASCII ones - survives. wait=False because
-#    wait=True deadlocks under Task Scheduler (wscript hangs without spawning
-#    the child; verified empirically, works fine interactively). The named
-#    mutex in the sync script is what prevents overlapping runs from piling up:
-#    a new run exits immediately while an old one still holds the mutex. ─────
+#    wait=True deadlocks under Task Scheduler (verified empirically); the lock
+#    file in the sync script is what prevents overlapping runs from piling up.
 @'
 ' Runs the Claude session sync with no visible window (used by the ClaudeChatSync scheduled task).
 Set sh = CreateObject("WScript.Shell")
@@ -95,7 +110,7 @@ Start-Sleep 6
 $lastLine = Get-Content $SyncLogFile -Tail 1 -ErrorAction SilentlyContinue
 $fresh = $false
 if ($lastLine -match '^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})') {
-    $fresh = ([datetime]::ParseExact($Matches[1], 'yyyy-MM-dd HH:mm:ss', $null) -gt (Get-Date).AddMinutes(-2))
+    $fresh = ([datetime]::ParseExact($Matches[1], 'yyyy-MM-dd HH:mm:ss', [System.Globalization.CultureInfo]::InvariantCulture) -gt (Get-Date).AddMinutes(-2))
 }
 if ($fresh) {
     Write-Host 'First sync ran and wrote its heartbeat:' -ForegroundColor Green

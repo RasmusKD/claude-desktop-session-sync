@@ -26,8 +26,20 @@ jobs:
           $r = Invoke-Pester -Path tests -CI -PassThru
           if ($r.FailedCount -gt 0 -or $r.Result -ne 'Passed') { exit 1 }
 
-      - name: Tests under non-invariant cultures (tr-TR, th-TH)
+      - name: Tests under non-invariant cultures (tr-TR, th-TH) on PowerShell 7
         shell: pwsh
+        run: |
+          Install-Module Pester -Force -Scope CurrentUser -SkipPublisherCheck -RequiredVersion 5.7.1
+          Import-Module Pester -RequiredVersion 5.7.1
+          foreach ($culture in 'tr-TR', 'th-TH') {
+            [System.Threading.Thread]::CurrentThread.CurrentCulture = $culture
+            [System.Threading.Thread]::CurrentThread.CurrentUICulture = $culture
+            $r = Invoke-Pester -Path tests -CI -PassThru
+            if ($r.FailedCount -gt 0 -or $r.Result -ne 'Passed') { Write-Host "FAILED under $culture"; exit 1 }
+          }
+
+      - name: Tests under non-invariant cultures (tr-TR, th-TH) on Windows PowerShell 5.1
+        shell: powershell
         run: |
           Install-Module Pester -Force -Scope CurrentUser -SkipPublisherCheck -RequiredVersion 5.7.1
           Import-Module Pester -RequiredVersion 5.7.1
