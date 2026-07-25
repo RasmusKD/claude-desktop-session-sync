@@ -26,8 +26,9 @@ A scheduled task (`ClaudeChatSync`) runs a sync every 5 minutes:
 
 - **Newest-healthy-wins, per chat file.** Renames and archive-status follow whichever account touched the chat last. Health beats timestamps: a copy that the app's startup scanner has damaged (stripped `cliSessionId` / `transcriptUnavailable: true`, see [#63082](https://github.com/anthropics/claude-code/issues/63082)) never overwrites a healthy copy, and a healthy copy heals a damaged one even when the damaged one is newer. An unreadable (locked, mid-write) copy neither wins nor loses protection. Note this is per-file, not a field-level merge: if you rename a chat on one account and archive it on the other before a sync runs, the older of the two edits loses.
 - **Atomic writes.** Every copy goes to a temp sibling, is verified (size + health), then renamed into place. The app can never observe a half-written session file.
-- **Overwrites, never deletes.** The sync never deletes a file, but it does overwrite older versions with newer ones; that is its job. Chat *transcripts* live elsewhere (`~/.claude/projects/`) and are never touched; these files are list metadata (title, archive flag, model, working directory). The installer also takes a one-time zip backup of both session roots before the first sync. (Consequence of copy-only: deleting a chat on one account resurrects it from the other, so archive instead of deleting.)
-- **A fresh account is seeded.** A newly added account's empty workspace folder receives the shared list on the next run, before its first chat.
+- **Overwrites and deletions are mirrored, with a safety net.** Newer chat-list metadata overwrites older; that is the job. Deleting a chat on one account deletes it on the others too, tracked via a manifest of fully-synced chats so a deletion is never confused with a not-yet-synced new chat. Before a propagated deletion, the last copy is stashed in `%LOCALAPPDATA%\ClaudeChatSync\deleted\`, and the installer takes a one-time zip backup of both session roots before the first sync. Chat *transcripts* live elsewhere (`~/.claude/projects/`) and are never touched; these files are list metadata (title, archive flag, model, working directory).
+- **Sidebar groups follow you.** Group definitions and their chat membership live account-keyed in `claude_desktop_config.json`; the sync mirrors them across your accounts (union semantics). Per-folder permission modes are filled in the same way (gaps only; an explicit setting is never overwritten). Config writes are atomic, happen only when something changed, and the five most recent config backups are kept next to the log.
+- **A fresh account is seeded.** A newly added account's empty workspace folder receives the shared list on the next run, before its first chat. An empty workspace is never treated as deletion evidence.
 - **Both known data roots are checked** on every run (`%APPDATA%\Claude` and `%LOCALAPPDATA%\Claude-3p`, the migration target present in current app builds).
 - **Every run writes a heartbeat** to `sync-log.txt`, so a silently dead sync is distinguishable from a quiet one. `sync-claude-sessions.ps1 -Status` prints roots/targets/last-run at a glance.
 - **Concurrent runs are serialized** by a named mutex (scheduled task + manual run can't interleave), and the task is registered battery-safe and reboot-safe. Task Scheduler defaults would silently stop it on both counts: see the Microsoft docs on [battery conditions](https://learn.microsoft.com/en-us/windows/win32/taskschd/tasksettings-disallowstartifonbatteries) and [missed-start behavior](https://learn.microsoft.com/en-us/troubleshoot/windows-server/system-management-components/scheduled-task-not-run-upon-reboot-machine-off).
@@ -58,6 +59,7 @@ Stops and removes the task and the installed script. Your chat files are left ex
 
 ## What this does NOT do
 
+- **Regular claude.ai ("Home") conversations are not synced.** Those are stored server-side in each Claude account; the desktop app only displays them from the cloud. There is no local file to mirror, so no local tool can share them across accounts. Only Claude Code sessions have local files.
 - **Connectors / MCP OAuth grants are not shared.** Those are bound to each Claude account server-side; no local tool can move them. Authorize connectors once per account.
 - **Usage/quota is per account and stays per account.** This tool only mirrors local chat-list metadata; nothing server-side is touched or circumvented.
 - **CLI history is out of scope.** The CLI (`claude --resume`) already reads its transcripts account-agnostically.
@@ -65,6 +67,8 @@ Stops and removes the task and the installed script. Your chat files are left ex
 ## Limitations
 
 - Chats created less than ~5 minutes before an account switch may not have synced yet. Run the sync script manually before switching, or restart the app a few minutes later.
+- A chat deletion wins over an edit made to the same chat on another account since the last sync (the deletion propagates; the edited copy is what lands in the `deleted\` stash).
+- Group deletions do not propagate: groups merge by union, so a group deleted on one account can reappear from the other until it is deleted on all accounts.
 - The app must be restarted to reflect changes made while it was open (startup-read, no live watch).
 - Windows only. Target runtime is Windows PowerShell 5.1 (the built-in `powershell.exe`).
 - This relies on **undocumented internals** of the Claude desktop app (folder layout observed in v1.24012.x). Any update may change the storage format or location and break the sync; the app has [changed this layout before](https://github.com/anthropics/claude-code/issues/29373). The failure mode is a no-op, and you can see it: the heartbeat line will report 0 roots or 1 workspace.
@@ -82,7 +86,7 @@ Stops and removes the task and the installed script. Your chat files are left ex
 Invoke-Pester -Path tests    # requires Pester 5+
 ```
 
-The suite runs the engine against fixture trees: cross-account propagation, fresh-account seeding, damaged-never-beats-healthy (and healing), locked-destination protection, multi-workspace device skip, and `-WhatIf` inertness.
+The suite runs the engine against fixture trees: cross-account propagation, fresh-account seeding, damaged-never-beats-healthy (and healing), locked-destination protection, multi-workspace device skip, deletion propagation with its fresh-account guard, sidebar-group mirroring, and `-WhatIf` inertness.
 
 ## License
 
