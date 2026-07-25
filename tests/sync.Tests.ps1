@@ -230,7 +230,9 @@ Describe 'config mirroring (raw splice)' {
         Invoke-Sync $root $state -ConfigPath $cfgPath          # mirrors to devB, records consensus
         Invoke-Sync $root $state -ConfigPath $cfgPath          # steady state, consensus confirmed
         $t = Get-Content $cfgPath -Raw
-        $i = $t.IndexOf('"name":"work"')                       # first occurrence = one account's entry
+        # Ordinal: culture-sensitive IndexOf (th-TH) matches at shifted positions
+        # and would corrupt the fixture, which the engine then rightly refuses.
+        $i = $t.IndexOf('"name":"work"', [System.StringComparison]::Ordinal)
         $t = $t.Substring(0, $i) + '"name":"Work"' + $t.Substring($i + '"name":"work"'.Length)
         Set-Content -Path $cfgPath -Value $t -NoNewline
         Invoke-Sync $root $state -ConfigPath $cfgPath          # divergent entry wins the tie
