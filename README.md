@@ -1,5 +1,7 @@
 # claude-desktop-session-sync
 
+![tests](https://github.com/RasmusKD/claude-desktop-session-sync/actions/workflows/tests.yml/badge.svg)
+
 Keep your Claude Code chat list when switching accounts in the **Claude desktop app** on Windows.
 
 ## The problem
@@ -38,8 +40,12 @@ The app reads the sessions folder **at startup** (it does not watch it live), so
 ## Install
 
 ```powershell
+git clone https://github.com/RasmusKD/claude-desktop-session-sync
+cd claude-desktop-session-sync
 powershell -ExecutionPolicy Bypass -File install.ps1
 ```
+
+(No git? Download the ZIP from GitHub, extract it, and run the last line from the extracted folder.)
 
 The installer copies the sync script to `%LOCALAPPDATA%\ClaudeChatSync\` and registers the task against that copy, so the repo clone stays a repo and `git pull` can never silently change what the scheduled task executes. No admin rights required (per-user task). It refuses to replace a scheduled task it doesn't recognize as its own, and it verifies the first run by checking for a fresh heartbeat, not by trusting exit codes.
 
