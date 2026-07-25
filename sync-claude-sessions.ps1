@@ -325,7 +325,9 @@ if (@($targets).Count -ge 2 -and $sourceSet.Count -ge 1) {
                         Sort-Object Name -Descending | Select-Object -Skip 5 |
                         Remove-Item -Force -ErrorAction SilentlyContinue
                     $tmpCfg = "$configPath.cs-tmp-$PID"
-                    $cfg | ConvertTo-Json -Depth 64 | Set-Content -Path $tmpCfg -Encoding UTF8 -ErrorAction Stop
+                    # WriteAllText = UTF-8 WITHOUT BOM. PS 5.1's Set-Content -Encoding UTF8
+                    # writes a BOM, which strict JSON parsers reject.
+                    [System.IO.File]::WriteAllText($tmpCfg, ($cfg | ConvertTo-Json -Depth 64))
                     Move-Item -LiteralPath $tmpCfg -Destination $configPath -Force -ErrorAction Stop
                     $cfgState = 'updated'
                 }
