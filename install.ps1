@@ -31,12 +31,15 @@ if (-not $existingBackup -and @($backupRoots).Count -gt 0) {
 }
 
 # ── Launcher: path arrives as a task argument (task XML is UTF-16), so any
-#    username - including non-ASCII ones - survives. wait=True makes the task's
-#    ExecutionTimeLimit actually bound the sync. ─────────────────────────────
+#    username - including non-ASCII ones - survives. wait=False because
+#    wait=True deadlocks under Task Scheduler (wscript hangs without spawning
+#    the child; verified empirically, works fine interactively). The named
+#    mutex in the sync script is what prevents overlapping runs from piling up:
+#    a new run exits immediately while an old one still holds the mutex. ─────
 @'
 ' Runs the Claude session sync with no visible window (used by the ClaudeChatSync scheduled task).
 Set sh = CreateObject("WScript.Shell")
-sh.Run "powershell -NoProfile -ExecutionPolicy Bypass -File """ & WScript.Arguments(0) & """ -Quiet", 0, True
+sh.Run "powershell -NoProfile -ExecutionPolicy Bypass -File """ & WScript.Arguments(0) & """ -Quiet", 0, False
 '@ | Set-Content -Path $SyncLauncher -Encoding ASCII
 
 $action = New-ScheduledTaskAction -Execute 'wscript.exe' -Argument "`"$SyncLauncher`" `"$SyncScriptInstalled`""
