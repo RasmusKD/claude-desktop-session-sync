@@ -4,29 +4,43 @@
 #  - takes a one-time zip backup of the session folders before the first sync
 #  - registers hardened triggers/settings (battery-safe, reboot-safe)
 #  - refuses to touch a scheduled task it does not recognize as its own
+param([switch]$Force)
 $ErrorActionPreference = 'Stop'
 . "$PSScriptRoot\common.ps1"
 
 $srcScript = Join-Path $PSScriptRoot 'sync-claude-sessions.ps1'
 if (-not (Test-Path $srcScript)) { throw 'sync-claude-sessions.ps1 not found next to install.ps1' }
 
+function Get-ToolVersion($path) {
+    $m = Select-String -Path $path -Pattern "^\`$ToolVersion\s*=\s*'([^']+)'" | Select-Object -First 1
+    if ($m) { $m.Matches[0].Groups[1].Value } else { '' }
+}
+
 # ── Payload to a stable, user-private location ───────────────────────────────
 New-Item -ItemType Directory -Force -Path $SyncInstallDir | Out-Null
+$installedVer = if (Test-Path $SyncScriptInstalled) { Get-ToolVersion $SyncScriptInstalled } else { '' }
+$srcVer = Get-ToolVersion $srcScript
 Copy-Item $srcScript -Destination $SyncScriptInstalled -Force
 
-# ── One-time backup of both session roots ────────────────────────────────────
+# ── Backup on first install AND on every version change: the users upgrading
+#    into new behavior are exactly the ones who need a fresh snapshot. ───────
 $existingBackup = Get-ChildItem -Path $SyncInstallDir -Filter 'backup-*.zip' -ErrorAction SilentlyContinue
 $backupRoots = @(
     (Join-Path $env:APPDATA 'Claude\claude-code-sessions'),
     (Join-Path $env:LOCALAPPDATA 'Claude-3p\claude-code-sessions')
 ) | Where-Object { Test-Path $_ }
-if (-not $existingBackup -and @($backupRoots).Count -gt 0) {
+$needBackup = (-not $existingBackup) -or ($installedVer -ne $srcVer)
+if ($needBackup -and @($backupRoots).Count -gt 0) {
     $zip = Join-Path $SyncInstallDir "backup-$(Get-Date -Format 'yyyyMMdd-HHmmss').zip"
     try {
         Compress-Archive -Path $backupRoots -DestinationPath $zip -ErrorAction Stop
         Write-Host "Pre-sync backup written: $zip" -ForegroundColor Green
+        Get-ChildItem -Path $SyncInstallDir -Filter 'backup-*.zip' -File |
+            Sort-Object Name -Descending | Select-Object -Skip 3 |
+            Remove-Item -Force -ErrorAction SilentlyContinue
     } catch {
-        Write-Host "Backup failed ($($_.Exception.Message)) - continuing without it." -ForegroundColor Yellow
+        if (-not $Force) { throw "Backup failed ($($_.Exception.Message)). Refusing to install a tool that propagates deletions without a snapshot. Re-run with -Force to override." }
+        Write-Host "Backup failed ($($_.Exception.Message)) - continuing because -Force was given." -ForegroundColor Yellow
     }
 }
 

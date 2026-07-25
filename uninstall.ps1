@@ -22,6 +22,11 @@ foreach ($f in @($SyncLauncher, $SyncScriptInstalled)) {
     if (Test-Path $f) { Remove-Item $f -Force; Write-Host "Removed $f" }
 }
 
+# The manifest is derived state, and a stale one is dangerous: reinstalling
+# months later must never propagate deletions recorded in a previous era.
+$manifest = Join-Path $SyncInstallDir 'sync-fullset.txt'
+if (Test-Path $manifest) { Remove-Item $manifest -Force; Write-Host 'Removed the sync manifest (derived state; rebuilt on reinstall).' }
+
 $leftovers = Get-ChildItem -Path $SyncInstallDir -ErrorAction SilentlyContinue
 if ($leftovers) {
     Write-Host "Kept (backups + log): $SyncInstallDir - delete it yourself if you don't want them."
