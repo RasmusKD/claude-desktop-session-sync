@@ -491,8 +491,10 @@ if (@($activeTargets).Count -ge 2 -and $sourceSet.Count -ge 1) {
             }
 
             # Root walk: provably the right object, never the first textual hit.
+            # [char] overloads on purpose: String.IndexOf(String) is culture
+            # sensitive, and ICU cultures treat punctuation as ignorable.
             function Resolve-KeyPath([string]$s, [string[]]$path) {
-                $objStart = $s.IndexOf('{')
+                $objStart = $s.IndexOf([char]'{')
                 if ($objStart -lt 0) { return -1 }
                 foreach ($p in $path) {
                     $span = Find-KeySpan $s $objStart $p
@@ -549,7 +551,7 @@ if (@($activeTargets).Count -ge 2 -and $sourceSet.Count -ge 1) {
                             # last-wins parsing renders permanently inert.
                             $scopesEnd = Skip-JsonValue $out $os
                             $scopesRawTxt = $out.Substring($os, $scopesEnd - $os)
-                            $wsId = $k.Substring($k.IndexOf('/') + 1)
+                            $wsId = $k.Substring($k.IndexOf([char]'/') + 1)
                             if ($scopesRawTxt.IndexOf($wsId, [System.StringComparison]::Ordinal) -ge 0) {
                                 Log "warning: scope key '$k' exists in another encoding; refusing to insert a duplicate"
                                 Set-Content -Path $brokenF -Value "Scope key '$k' could not be matched but its workspace id is present in dframe-group-scopes (different escape encoding). Group mirroring is paused to avoid inserting a duplicate key. At: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')" -ErrorAction SilentlyContinue
