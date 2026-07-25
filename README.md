@@ -70,7 +70,7 @@ Stops and removes the task and the installed script. Your chat files are left ex
 - A chat deletion wins over an edit made to the same chat on another account since the last sync (the deletion propagates; the edited copy is what lands in the `deleted\` stash).
 - Group deletions do not propagate: groups merge by union, so a group deleted on one account can reappear from the other until it is deleted on all accounts.
 - The app must be restarted to reflect changes made while it was open (startup-read, no live watch).
-- Windows only. Target runtime is Windows PowerShell 5.1 (the built-in `powershell.exe`).
+- Windows only. The scheduled task runs on Windows PowerShell 5.1 (the built-in `powershell.exe`, present on every Windows machine, so the tool has zero install dependencies). The scripts are also verified against PowerShell 7 (test suite passes on both 5.1 and 7.6), so you can run or test them under `pwsh` too.
 - This relies on **undocumented internals** of the Claude desktop app (folder layout observed in v1.24012.x). Any update may change the storage format or location and break the sync; the app has [changed this layout before](https://github.com/anthropics/claude-code/issues/29373). The failure mode is a no-op, and you can see it: the heartbeat line will report 0 roots or 1 workspace.
 
 ## Safety notes
