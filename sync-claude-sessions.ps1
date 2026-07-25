@@ -1,6 +1,5 @@
 # Bidirectional Claude Code chat-list sync across Claude desktop accounts on this
-# machine. See README.md for the full design rationale and AUDIT.md for the
-# adversarial-review history that shaped these invariants.
+# machine. See README.md for the full design rationale.
 #
 # Design invariants:
 #  - one sync target per device-id (account): its single workspace folder. A device
