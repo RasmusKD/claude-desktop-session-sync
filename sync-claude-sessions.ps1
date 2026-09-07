@@ -18,13 +18,16 @@
 #    are discarded, never trusted). Partially-failed deletions stay listed as
 #    pending so the next run retries instead of reseeding. Stash entries are
 #    stamped with the STASH time, so retention means what the README says.
-#  - sidebar groups mirror by last-writer-wins raw text splice. The scanner walks
-#    preferences -> epitaxyPrefs -> dframe-group-scopes from the document root
-#    (never a regex anchor), all raw-text comparisons are ORDINAL, the config is
-#    parse-validated before and after every splice, a duplicate-key guard refuses
-#    to insert next to an unmatched-but-similar key, and ties in the activity
-#    signal are broken by a stored consensus hash: the entry that changed since
-#    the last splice is the writer.
+#  - sidebar groups live in the app's Local Storage (a LevelDB the app holds
+#    open while it runs). They are merged three-way against the last synced
+#    result by group-sync\group-sync.mjs, which opens that database with a real
+#    LevelDB implementation, only while the app is closed (its own lock refuses
+#    us otherwise, reported as "deferred", never as success), backup-first, and
+#    then mirrors the result into claude_desktop_config.json the way the app
+#    itself does. Without Node.js the group stage is off and everything else runs.
+#  - a process whose view of %LOCALAPPDATA% is an MSIX shadow (one launched from
+#    inside the desktop app) refuses to run: its state directory would be a
+#    copy nobody else reads, and its log would look dead from everywhere else.
 #  - a lock file serializes concurrent runs; persistent failure states escalate
 #    to marker files that -Status surfaces.
 [CmdletBinding(SupportsShouldProcess = $true)]
@@ -35,12 +38,16 @@ param(
     [string]$Unfreeze,            # scope key (device/workspace) to thaw
     [string[]]$RootsOverride,     # unsupported test hook: fixture tree
     [string]$ConfigPathOverride,  # unsupported test hook: fixture config
-    [string]$StateDirOverride     # unsupported test hook: keep state out of the repo
+    [string]$StateDirOverride,    # unsupported test hook: keep state out of the repo
+    [string]$LevelDbPathOverride, # unsupported test hook: fixture Local Storage (skips the app-running pre-check)
+    [string]$GroupHelperOverride, # unsupported test hook: helper directory
+    [string]$PackagesRootOverride # unsupported test hook: MSIX packages root for the shadow probe
 )
 $ErrorActionPreference = 'Continue'
-$ToolVersion = '0.5.0'
+$ToolVersion = '0.6.0'
 $ManifestMaxAgeDays = 7
 $StashRetentionDays = 30
+. "$PSScriptRoot\common.ps1"
 
 $roots = if ($RootsOverride) { @($RootsOverride | Where-Object { Test-Path $_ }) } else {
     @(
@@ -49,6 +56,9 @@ $roots = if ($RootsOverride) { @($RootsOverride | Where-Object { Test-Path $_ })
     ) | Where-Object { Test-Path $_ }
 }
 $configPath = if ($ConfigPathOverride) { $ConfigPathOverride } else { Join-Path $env:APPDATA 'Claude\claude_desktop_config.json' }
+$leveldbPath = if ($LevelDbPathOverride) { $LevelDbPathOverride } else { $ClaudeLocalStorageDir }
+$helperDir = if ($GroupHelperOverride) { $GroupHelperOverride } else { Join-Path $PSScriptRoot 'group-sync' }
+$packagesRoot = if ($PackagesRootOverride) { $PackagesRootOverride } else { Join-Path $env:LOCALAPPDATA 'Packages' }
 # State always lives in the per-user install dir, never next to whichever copy of
 # the script happened to run: a git-clone test run must not write logs, manifests
 # or config backups (which can carry MCP secrets) into a tree someone might push.
@@ -61,17 +71,25 @@ $logF        = Join-Path $stateDir 'sync-log.txt'
 $manifestF   = Join-Path $stateDir 'sync-fullset.txt'
 $deletedD    = Join-Path $stateDir 'deleted'
 $frozenF     = Join-Path $stateDir 'frozen.txt'
-$brokenF     = Join-Path $stateDir 'CONFIG-MIRROR-BROKEN.txt'
+$brokenF     = Join-Path $stateDir 'GROUP-SYNC-BROKEN.txt'
 $lockStuckF  = Join-Path $stateDir 'SYNC-LOCK-STUCK.txt'
-$cfgErrCntF  = Join-Path $stateDir 'cfg-error-count.txt'
+$grpErrCntF  = Join-Path $stateDir 'groups-error-count.txt'
 $lockCntF    = Join-Path $stateDir 'lock-skip-count.txt'
-$consensusF  = Join-Path $stateDir 'cfg-consensus.txt'
-$cfgOriginal = Join-Path $stateDir 'config-original.json'
+$groupsBaseF = Join-Path $stateDir 'groups-base.json'
 
 function Log($msg) {
     $line = "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')  $msg"
     Add-Content -Path $logF -Value $line -ErrorAction SilentlyContinue
     if (-not $Quiet) { Write-Host $line }
+}
+
+# A shadowed process must not run: everything it wrote would land in a mirror
+# only processes launched the same way can see. -Status still reports, in red.
+$shadowDir = Get-ShadowDir $stateDir $packagesRoot
+if ($shadowDir -and -not $Status) {
+    Write-Host "refused: this process sees an MSIX shadow of $stateDir (at $shadowDir)." -ForegroundColor Red
+    Write-Host 'It was launched from inside the Claude desktop app. Run the sync from a normal terminal, or let the scheduled task run it.'
+    exit 2
 }
 
 function Get-HealthRaw($path) {
@@ -83,12 +101,6 @@ function Get-HealthRaw($path) {
         if ($raw -match '(?<!\\)"cliSessionId"\s*:\s*"[^"]+"') { return 'healthy' }
         return 'damaged'
     } catch { return 'unknown' }
-}
-
-function Get-Sha([string]$t) {
-    $sha = [System.Security.Cryptography.SHA256]::Create()
-    try { ([BitConverter]::ToString($sha.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($t)))) -replace '-' }
-    finally { $sha.Dispose() }
 }
 
 function Get-NewestActivity($wsPath) {
@@ -199,10 +211,22 @@ $frozen = $frozenSet.Count
 
 if ($Status) {
     Write-Host "claude-desktop-session-sync v$ToolVersion"
+    if ($shadowDir) {
+        Write-Host "ATTENTION: this process sees an MSIX shadow of $stateDir (at $shadowDir); the log and state shown below are that shadow, not what the scheduled task writes. Run -Status from a normal terminal." -ForegroundColor Red
+    }
     Write-Host "roots found:      $(@($roots).Count) (active: $activeRoot)"
     Write-Host "sync targets:     $(@($activeTargets).Count) active workspace(s), $($sourceSet.Count) with chats, $skippedDevices device(s) skipped"
     if ($frozen -gt 0) { Write-Host "frozen:           $(@($frozenSet.Keys) -join ', ')  (thaw with -Unfreeze)" -ForegroundColor Yellow }
     Write-Host "manifest:         $($prevFull.Count) fully-synced chat(s) tracked"
+    $hs = Get-GroupHelperState $helperDir
+    if ($hs.ok) {
+        $appNote = if (Test-ClaudeAppRunning) { 'the app is running, so groups sync on the first run after it closes' } else { 'app closed' }
+        $baseNote = if (Test-Path $groupsBaseF) { "base $(([System.IO.File]::GetLastWriteTime($groupsBaseF)).ToString('yyyy-MM-dd HH:mm'))" } else { 'no base yet' }
+        Write-Host "group sync:       on ($appNote; $baseNote)"
+    } else {
+        Write-Host "group sync:       off ($($hs.reason))" -ForegroundColor Yellow
+    }
+    Write-Host "log:              $logF"
     foreach ($marker in @($brokenF, $lockStuckF)) {
         if (Test-Path $marker) { Write-Host "ATTENTION: $(Split-Path $marker -Leaf) exists; see $marker" -ForegroundColor Red }
     }
@@ -243,6 +267,9 @@ foreach ($d in @((Split-Path $configPath -Parent), $stateDir)) {
             Remove-Item -Force -ErrorAction SilentlyContinue
     }
 }
+# A Local Storage snapshot the helper took and never promoted (killed mid-run).
+Get-ChildItem -Path $stateDir -Filter 'leveldb-backup-*.tmp' -Directory -ErrorAction SilentlyContinue |
+    Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
 # Stash retention keys on the file's write time, which the stash write STAMPS
 # (Copy-Item would otherwise inherit the chat's own last-edit time, silently
 # gutting retention for any chat older than the window).
@@ -284,7 +311,7 @@ if ($Restore) {
     exit 0
 }
 
-$copies = 0; $skipped = 0; $contestedCount = 0; $deleted = 0; $cfgState = 'skipped'
+$copies = 0; $skipped = 0; $contestedCount = 0; $deleted = 0; $groupsState = 'skipped'
 $failedDeletes = @{}
 
 if (@($activeTargets).Count -ge 2 -and $sourceSet.Count -ge 1) {
@@ -420,202 +447,68 @@ if (@($activeTargets).Count -ge 2 -and $sourceSet.Count -ge 1) {
         }
     }
 
-    # ── Sidebar groups: last-writer-wins raw text splice ─────────────────────
-    # The scanner is fuzz-verified, but correctness is CHECKED, not assumed: the
-    # config must parse before we touch it and after we splice it, the anchor is
-    # a root walk (not a regex), comparisons are ordinal, and an unmatched key
-    # never gets a duplicate inserted next to it.
-    $cfgState = 'unchanged'
-    if ((Test-Path $configPath) -and @($allTargets).Count -ge 2) {
+    # ── Sidebar groups: three-way merge in Local Storage, app closed only ────
+    # The helper owns the merge, the backups and the config mirror; this side
+    # decides whether it may run at all and turns its answer into state.
+    $groupsState = 'off'
+    $hs = Get-GroupHelperState $helperDir
+    if (-not $hs.ok) {
+        $groupsState = 'off'
+    } elseif ($RootsOverride -and -not $LevelDbPathOverride) {
+        # A fixture tree never pairs with the real Local Storage: its scope keys
+        # would be merged into the app's database as new accounts.
+        $groupsState = 'off'
+    } elseif (-not (Test-Path -LiteralPath $leveldbPath)) {
+        $groupsState = 'off'
+        Log "warning: Local Storage not found at $leveldbPath; group sync off"
+    } elseif ((-not $LevelDbPathOverride) -and (Test-ClaudeAppRunning)) {
+        # Cheap pre-check. The authoritative refusal is the app's own LevelDB lock
+        # inside the helper; this only avoids taking a snapshot for nothing.
+        $groupsState = 'deferred'
+    } else {
+        $scopeKeys = (@($allTargets | ForEach-Object { Get-ScopeKey $_ }) -join ';')
+        $helperArgs = @('--leveldb', $leveldbPath, '--state', $stateDir, '--scopes', $scopeKeys)
+        # The mirror gets the real config only on a real run: a fixture tree's
+        # scopes must never be written into the app's config.
+        $mirrorConfig = (Test-Path -LiteralPath $configPath) -and -not ($RootsOverride -and -not $ConfigPathOverride)
+        if ($mirrorConfig) { $helperArgs += @('--config', $configPath) }
+        if ($WhatIfPreference) { $helperArgs += '--dry-run' }
+        $raw = ''
         try {
-            $cfgRaw = [System.IO.File]::ReadAllText($configPath)
-            $hadBom = $false
-            try {
-                $fs = [System.IO.File]::OpenRead($configPath)
-                try { $b = New-Object byte[] 3; [void]$fs.Read($b, 0, 3); $hadBom = ($b[0] -eq 0xEF -and $b[1] -eq 0xBB -and $b[2] -eq 0xBF) } finally { $fs.Dispose() }
-            } catch { }
-            try { $null = $cfgRaw | ConvertFrom-Json } catch {
-                Log 'warning: config is not valid JSON; refusing to splice'
-                throw
+            $raw = (& $hs.node $hs.script @helperArgs 2>&1 | Out-String)
+            $code = $LASTEXITCODE
+        } catch { $raw = $_.Exception.Message; $code = 1 }
+        $res = $null
+        $jsonLine = @($raw -split "`r?`n" | Where-Object { $_.TrimStart().StartsWith('{') }) | Select-Object -Last 1
+        if ($jsonLine) { try { $res = $jsonLine | ConvertFrom-Json } catch { } }
+        if (-not $res) {
+            $groupsState = 'error'
+            Log "warning: group helper produced no result (exit $code): $($raw.Trim())"
+        } else {
+            foreach ($w in @($res.warnings)) { if ($w) { Log "warning: groups: $w" } }
+            switch ($res.status) {
+                'updated'      { $groupsState = 'updated'; Log "groups merged into $(@($res.scopesRewritten).Count) scope(s): +$(@($res.changes.groupsAdded).Count) -$(@($res.changes.groupsRemoved).Count) ~$(@($res.changes.groupsChanged).Count) group(s), $($res.changes.assignmentsChanged) assignment(s); backup $($res.backupDir); config $($res.configState)" }
+                'would-update' { $groupsState = 'would-update'; Log "groups would be merged into $(@($res.scopesRewritten).Count) scope(s) (-WhatIf)" }
+                'unchanged'    { $groupsState = if ($res.configState -eq 'updated') { 'mirrored' } else { 'unchanged' } }
+                'deferred'     { $groupsState = 'deferred' }
+                default        { $groupsState = 'error'; Log "warning: group sync failed: $($res.reason)" }
             }
-
-            function Skip-JsonValue([string]$s, [int]$i) {
-                while ($i -lt $s.Length -and [char]::IsWhiteSpace($s[$i])) { $i++ }
-                if ($i -ge $s.Length) { return -1 }
-                $c = $s[$i]
-                if ($c -eq '"') {
-                    $i++
-                    while ($i -lt $s.Length) {
-                        if ($s[$i] -eq '\') { $i += 2; continue }
-                        if ($s[$i] -eq '"') { return $i + 1 }
-                        $i++
-                    }
-                    return -1
-                }
-                if ($c -eq '{' -or $c -eq '[') {
-                    $open = $c; $close = if ($c -eq '{') { '}' } else { ']' }
-                    $depth = 0
-                    while ($i -lt $s.Length) {
-                        $ch = $s[$i]
-                        if ($ch -eq '"') { $i = Skip-JsonValue $s $i; if ($i -lt 0) { return -1 }; continue }
-                        if ($ch -eq $open) { $depth++ }
-                        elseif ($ch -eq $close) { $depth--; if ($depth -eq 0) { return $i + 1 } }
-                        $i++
-                    }
-                    return -1
-                }
-                while ($i -lt $s.Length -and $s[$i] -notmatch '[,\}\]\s]') { $i++ }
-                return $i
-            }
-
-            function Find-KeySpan([string]$s, [int]$objStart, [string]$key) {
-                $i = $objStart + 1
-                while ($i -lt $s.Length) {
-                    while ($i -lt $s.Length -and ($s[$i] -match '[\s,]')) { $i++ }
-                    if ($i -ge $s.Length -or $s[$i] -eq '}') { return $null }
-                    if ($s[$i] -ne '"') { return $null }
-                    $kEnd = Skip-JsonValue $s $i
-                    if ($kEnd -lt 0) { return $null }
-                    $k = $s.Substring($i + 1, $kEnd - $i - 2) -replace '\\/', '/'
-                    $j = $kEnd
-                    while ($j -lt $s.Length -and [char]::IsWhiteSpace($s[$j])) { $j++ }
-                    if ($s[$j] -ne ':') { return $null }
-                    $j++
-                    while ($j -lt $s.Length -and [char]::IsWhiteSpace($s[$j])) { $j++ }
-                    $vEnd = Skip-JsonValue $s $j
-                    if ($vEnd -lt 0) { return $null }
-                    if ([string]::Equals($k, $key, [System.StringComparison]::Ordinal)) { return @{ ValueStart = $j; ValueEnd = $vEnd } }
-                    $i = $vEnd
-                }
-                return $null
-            }
-
-            # Root walk: provably the right object, never the first textual hit.
-            # [char] overloads on purpose: String.IndexOf(String) is culture
-            # sensitive, and ICU cultures treat punctuation as ignorable.
-            function Resolve-KeyPath([string]$s, [string[]]$path) {
-                $objStart = $s.IndexOf([char]'{')
-                if ($objStart -lt 0) { return -1 }
-                foreach ($p in $path) {
-                    $span = Find-KeySpan $s $objStart $p
-                    if (-not $span) { return -1 }
-                    $objStart = $span.ValueStart
-                    if ($s[$objStart] -ne '{') { return -1 }
-                }
-                return $objStart
-            }
-
-            $scopesPath = @('preferences', 'epitaxyPrefs', 'dframe-group-scopes')
-            $scopesStart = Resolve-KeyPath $cfgRaw $scopesPath
-            if ($scopesStart -ge 0) {
-                # Collect each account's entry span in the CURRENT raw text.
-                $keySpans = @{}
-                foreach ($t in $allTargets) {
-                    $span = Find-KeySpan $cfgRaw $scopesStart (Get-ScopeKey $t)
-                    if ($span) { $keySpans[(Get-ScopeKey $t)] = $cfgRaw.Substring($span.ValueStart, $span.ValueEnd - $span.ValueStart) }
-                }
-                if ($keySpans.Count -gt 0) {
-                    # Winner: consensus-hash tiebreak first (the entry that changed
-                    # since our last splice is the writer; the sync equalizes the
-                    # activity mtimes, so ties are the steady state, not the edge),
-                    # then newest session activity.
-                    $prevConsensus = ''
-                    if (Test-Path $consensusF) { $prevConsensus = (Get-Content $consensusF -Raw -ErrorAction SilentlyContinue).Trim() }
-                    $divergent = @($keySpans.Keys | Where-Object { $prevConsensus -and (Get-Sha $keySpans[$_]) -ne $prevConsensus })
-                    $srcKeyName = $null
-                    if ($divergent.Count -eq 1) { $srcKeyName = $divergent[0] }
-                    else {
-                        foreach ($t in ($allTargets | Sort-Object { Get-NewestActivity $_.FullName } -Descending)) {
-                            $k = Get-ScopeKey $t
-                            if ($keySpans.ContainsKey($k)) { $srcKeyName = $k; break }
-                        }
-                    }
-                    $srcRaw = $keySpans[$srcKeyName]
-                    $out = $cfgRaw; $cfgChanged = $false; $refused = $false
-                    foreach ($t in $allTargets) {
-                        $k = Get-ScopeKey $t
-                        if ([string]::Equals($k, $srcKeyName, [System.StringComparison]::Ordinal)) { continue }
-                        $os = Resolve-KeyPath $out $scopesPath
-                        if ($os -lt 0) { $refused = $true; break }
-                        $span = Find-KeySpan $out $os $k
-                        if ($span) {
-                            $existing = $out.Substring($span.ValueStart, $span.ValueEnd - $span.ValueStart)
-                            if (-not [string]::Equals($existing, $srcRaw, [System.StringComparison]::Ordinal)) {
-                                $out = $out.Substring(0, $span.ValueStart) + $srcRaw + $out.Substring($span.ValueEnd)
-                                $cfgChanged = $true
-                            }
-                        } else {
-                            # Duplicate guard: if the workspace id appears anywhere in
-                            # the scopes object we failed to MATCH it (another escape
-                            # encoding); inserting would create a duplicate key that
-                            # last-wins parsing renders permanently inert.
-                            $scopesEnd = Skip-JsonValue $out $os
-                            $scopesRawTxt = $out.Substring($os, $scopesEnd - $os)
-                            $wsId = $k.Substring($k.IndexOf([char]'/') + 1)
-                            if ($scopesRawTxt.IndexOf($wsId, [System.StringComparison]::Ordinal) -ge 0) {
-                                Log "warning: scope key '$k' exists in another encoding; refusing to insert a duplicate"
-                                Set-Content -Path $brokenF -Value "Scope key '$k' could not be matched but its workspace id is present in dframe-group-scopes (different escape encoding). Group mirroring is paused to avoid inserting a duplicate key. At: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')" -ErrorAction SilentlyContinue
-                                $refused = $true
-                                continue
-                            }
-                            $insertAt = $os + 1
-                            $probe = $insertAt
-                            while ($probe -lt $out.Length -and [char]::IsWhiteSpace($out[$probe])) { $probe++ }
-                            $suffix = if ($out[$probe] -eq '}') { '' } else { ',' }
-                            $kEsc = $k -replace '"', '\"'
-                            $out = $out.Substring(0, $insertAt) + '"' + $kEsc + '":' + $srcRaw + $suffix + $out.Substring($insertAt)
-                            $cfgChanged = $true
-                        }
-                    }
-                    if ($cfgChanged -and -not $refused -and $PSCmdlet.ShouldProcess($configPath, 'mirror sidebar groups (raw splice)')) {
-                        # Output must parse, or the splice never lands. This guard is
-                        # what turns any future scanner bug into a skipped run.
-                        try { $null = $out | ConvertFrom-Json } catch {
-                            Log 'warning: splice produced invalid JSON; aborting write'
-                            throw
-                        }
-                        if (-not (Test-Path $cfgOriginal)) { Copy-Item -LiteralPath $configPath -Destination $cfgOriginal -Force -ErrorAction SilentlyContinue }
-                        Copy-Item -LiteralPath $configPath -Destination (Join-Path $stateDir "config-backup-$(Get-Date -Format 'yyyyMMdd-HHmmss').json") -Force
-                        Get-ChildItem -Path $stateDir -Filter 'config-backup-*.json' -File |
-                            Sort-Object Name -Descending | Select-Object -Skip 5 |
-                            Remove-Item -Force -ErrorAction SilentlyContinue
-                        $tmpCfg = "$configPath.cs-tmp-$PID"
-                        [System.IO.File]::WriteAllText($tmpCfg, $out, (New-Object System.Text.UTF8Encoding($hadBom)))
-                        # Lost-update guard (ordinal): if the app rewrote the config
-                        # between our read and now, skip; next run re-splices fresh.
-                        if (-not [string]::Equals([System.IO.File]::ReadAllText($configPath), $cfgRaw, [System.StringComparison]::Ordinal)) {
-                            Log 'warning: config changed under us; skipping this write'
-                            Remove-Item -LiteralPath $tmpCfg -Force -ErrorAction SilentlyContinue
-                        } else {
-                            Move-Item -LiteralPath $tmpCfg -Destination $configPath -Force -ErrorAction Stop
-                            $cfgState = 'updated'
-                            Set-Content -Path $consensusF -Value (Get-Sha $srcRaw) -ErrorAction SilentlyContinue
-                        }
-                    } elseif (-not $cfgChanged -and -not $refused) {
-                        # Already in consensus: remember it so the next divergence is attributable.
-                        Set-Content -Path $consensusF -Value (Get-Sha $srcRaw) -ErrorAction SilentlyContinue
-                    }
-                    if ($refused) { $cfgState = 'refused' }
-                }
-            }
-            if ($cfgState -ne 'refused') {
-                Set-Content -Path $cfgErrCntF -Value '0' -ErrorAction SilentlyContinue
-                if ((Test-Path $brokenF) -and $cfgState -ne 'refused') { Remove-Item -LiteralPath $brokenF -Force -ErrorAction SilentlyContinue }
-            }
-        } catch {
-            $cfgState = 'error'
-            Log "warning: config mirror skipped ($($_.Exception.Message))"
-            $n = 0; try { $n = [int](Get-Content $cfgErrCntF -ErrorAction SilentlyContinue) } catch { }
+        }
+        if ($groupsState -eq 'error') {
+            $n = 0; try { $n = [int](Get-Content $grpErrCntF -ErrorAction SilentlyContinue) } catch { }
             $n++
-            Set-Content -Path $cfgErrCntF -Value $n -ErrorAction SilentlyContinue
+            Set-Content -Path $grpErrCntF -Value $n -ErrorAction SilentlyContinue
             if ($n -ge 3) {
-                Set-Content -Path $brokenF -Value "Config mirroring has failed $n consecutive runs.`nLast error: $($_.Exception.Message)`nAt: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')" -ErrorAction SilentlyContinue
+                Set-Content -Path $brokenF -Value "Group sync has failed $n consecutive runs.`nLast output: $($raw.Trim())`nAt: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')" -ErrorAction SilentlyContinue
             }
+        } elseif ($groupsState -ne 'deferred') {
+            Set-Content -Path $grpErrCntF -Value '0' -ErrorAction SilentlyContinue
+            Remove-Item -LiteralPath $brokenF -Force -ErrorAction SilentlyContinue
         }
     }
 }
 
-Log "v$ToolVersion run: $(@($roots).Count) root(s), $(@($activeTargets).Count) workspace(s) ($($sourceSet.Count) with chats, $frozen frozen), $contestedCount contested, $copies copied, $skipped skipped, $deleted deleted, cfg $cfgState"
+Log "v$ToolVersion run: $(@($roots).Count) root(s), $(@($activeTargets).Count) workspace(s) ($($sourceSet.Count) with chats, $frozen frozen), $contestedCount contested, $copies copied, $skipped skipped, $deleted deleted, groups $groupsState"
 $tail = Get-Content $logF -Tail 1000 -ErrorAction SilentlyContinue
 if ($tail) {
     $tmpLog = "$logF.cs-tmp-$PID"

@@ -1,12 +1,18 @@
 # Pester 5 tests for the sync engine, run against fixture trees via -RootsOverride.
 # Covers: cross-account propagation, seeding, health rules (healing, title
 # false-positives), device guards, deletion propagation (partial-failure
-# non-resurrection, freeze durability, stash retention and quality), config
-# splice fidelity (verbatim bytes, case-sensitivity, duplicate-key refusal,
-# decoy anchors, BOM preservation), and -WhatIf inertness.
+# non-resurrection, freeze durability, stash retention and quality), sidebar
+# groups (three-way merge in a fixture Local Storage LevelDB, the app-running
+# refusal, the config mirror's byte fidelity, BOM and decoy anchors), the MSIX
+# shadow refusal, and -WhatIf inertness.
 
 BeforeAll {
-    $script:engine = Join-Path (Split-Path $PSScriptRoot -Parent) 'sync-claude-sessions.ps1'
+    $script:repo    = Split-Path $PSScriptRoot -Parent
+    $script:engine  = Join-Path $script:repo 'sync-claude-sessions.ps1'
+    $script:fixture = Join-Path $PSScriptRoot 'leveldb-fixture.mjs'
+    $script:node    = (Get-Command node -ErrorAction SilentlyContinue).Source
+    $script:noNode  = (-not $script:node) -or -not (Test-Path (Join-Path $script:repo 'group-sync\node_modules\classic-level\package.json'))
+    if ($script:noNode) { Write-Warning 'node or group-sync/node_modules missing: the sidebar-group tests are skipped (run npm ci in group-sync/).' }
 
     function New-Chat {
         param($Dir, $Name, [ValidateSet('healthy','damaged','junk','markerTitle')]$Kind = 'healthy', $AgeMinutes = 0)
@@ -35,18 +41,58 @@ BeforeAll {
         return $d
     }
 
+    # Every run points Local Storage AND the config at paths that do not exist
+    # unless a test hands it fixtures: a fixture tree must never pair with the
+    # real database or the real config (the engine refuses that pairing too).
     function Invoke-Sync {
-        param($Root, $StateDir, [switch]$WhatIf, [string]$ConfigPath = '')
-        $p = @{ RootsOverride = $Root; StateDirOverride = $StateDir; Quiet = $true }
-        if ($ConfigPath) { $p.ConfigPathOverride = $ConfigPath }
+        param($Root, $StateDir, [switch]$WhatIf, [switch]$Loud, [string]$ConfigPath = '', [string]$LevelDb = '', [string]$HelperDir = '', [string]$PackagesRoot = '')
+        $p = @{ RootsOverride = $Root; StateDirOverride = $StateDir; Quiet = (-not $Loud) }
+        $p.LevelDbPathOverride = if ($LevelDb) { $LevelDb } else { Join-Path $TestDrive 'no-leveldb-here' }
+        $p.ConfigPathOverride  = if ($ConfigPath) { $ConfigPath } else { Join-Path $TestDrive 'no-config-here.json' }
+        if ($HelperDir)    { $p.GroupHelperOverride = $HelperDir }
+        if ($PackagesRoot) { $p.PackagesRootOverride = $PackagesRoot }
         if ($WhatIf) { & $script:engine @p -WhatIf }
         else         { & $script:engine @p -Confirm:$false }
     }
 
-    function New-Config([string]$Text) {
+    function Get-Heartbeat($StateDir) { Get-Content (Join-Path $StateDir 'sync-log.txt') -Tail 1 }
+
+    function New-Config([string]$Text, [switch]$Bom) {
         $p = Join-Path $TestDrive ("cfg-" + [guid]::NewGuid().ToString('N').Substring(0, 8) + '.json')
-        Set-Content -Path $p -Value $Text -NoNewline
+        [System.IO.File]::WriteAllText($p, $Text, (New-Object System.Text.UTF8Encoding($Bom.IsPresent)))
         return $p
+    }
+
+    # ── Local Storage fixtures (shape observed in Claude desktop 1.46388.4) ──
+    function New-ScopeEntry([object[]]$Groups, [hashtable]$Assignments = @{}, [hashtable]$Order = @{}) {
+        @{ groups = @($Groups); assignments = $Assignments; order = $Order }
+    }
+    function New-LevelDb([hashtable]$Scopes, [string]$LastScope = '') {
+        $dir = Join-Path $TestDrive ("ldb-" + [guid]::NewGuid().ToString('N').Substring(0, 8))
+        $entries = @{
+            'dframe-store' = @{ state = @{ collapsed = $false; pinnedOrder = @('code:local_pinned'); collapsedGroups = @(); customGroupsByScope = $Scopes; lastSidebarScopeKey = $LastScope }; version = 1 }
+            'LSS-persisted.dframe-group-scopes' = @{ value = $Scopes; tabId = ''; timestamp = 1788766673183 }
+            'LSS-persisted.dframe-local-slice' = @{ value = @{ pinnedOrder = @('code:local_pinned'); homeProjectsPinnedOrder = @() }; tabId = ''; timestamp = 1788766673184 }
+            'spa:locale' = 'en-US'
+        }
+        $json = Join-Path $TestDrive ("ldb-entries-" + [guid]::NewGuid().ToString('N').Substring(0, 8) + '.json')
+        [System.IO.File]::WriteAllText($json, ($entries | ConvertTo-Json -Depth 30 -Compress), (New-Object System.Text.UTF8Encoding($false)))
+        & $script:node $script:fixture create $dir $json | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw "fixture create failed" }
+        return $dir
+    }
+    function Read-LevelDbJson([string]$Dir, [string]$Name) {
+        $out = (& $script:node $script:fixture read $Dir $Name) -join "`n"
+        if ($LASTEXITCODE -ne 0) { throw "fixture read failed" }
+        if (-not $out) { return $null }
+        $out | ConvertFrom-Json
+    }
+    function Get-LevelDbMeta([string]$Dir) { ((& $script:node $script:fixture meta $Dir) -join '') | ConvertFrom-Json }
+    function Get-ScopeFromStore($Dir, $Scope) { (Read-LevelDbJson $Dir 'dframe-store').state.customGroupsByScope.$Scope }
+    function Get-ScopeFromLss($Dir, $Scope)   { (Read-LevelDbJson $Dir 'LSS-persisted.dframe-group-scopes').value.$Scope }
+    function New-GroupConfig([switch]$Bom, [switch]$Decoy) {
+        $decoyText = if ($Decoy) { '"backupOfOldProfile": {"epitaxyPrefs": {"dframe-group-scopes": {"devA/ws1": {"groups": [{"id": "cg-decoy", "name": "DECOY"}], "assignments": {}, "order": {}}}}},' } else { '' }
+        New-Config -Bom:$Bom ('{' + "`n" + '  "coworkUserFilesPath": "C:\\Users\\x\\Cowork",' + "`n" + '  ' + $decoyText + "`n" + '  "preferences": {' + "`n" + '    "sidebarMode": "code",' + "`n" + '    "epitaxyPrefs": {' + "`n" + '      "starred-local-code-sessions": ["local_1"],' + "`n" + '      "dframe-group-scopes": {' + "`n" + '        "devA/ws1": {"groups": [], "assignments": {}, "order": {}}' + "`n" + '      },' + "`n" + '      "fastMode": {"value": false, "tabId": ""}' + "`n" + '    }' + "`n" + '  }' + "`n" + '}')
     }
 }
 
@@ -73,6 +119,13 @@ Describe 'cross-account propagation' {
         New-Chat (Join-Path $root 'devA/ws1') 'aaa' | Out-Null
         Invoke-Sync $root $state
         Join-Path $root 'devB/ws2/local_dmg.json' | Should -Exist
+    }
+
+    It 'writes a heartbeat naming the group stage even when it is off' {
+        $root = New-Fixture @('devA/ws1', 'devB/ws2'); $state = New-StateDir
+        New-Chat (Join-Path $root 'devA/ws1') 'aaa' | Out-Null
+        Invoke-Sync $root $state
+        Get-Heartbeat $state | Should -Match 'groups off$'
     }
 }
 
@@ -207,78 +260,201 @@ Describe 'deletion propagation' {
     }
 }
 
-Describe 'config mirroring (raw splice)' {
-    It 'copies the active account scope entry verbatim and leaves every other byte untouched' {
+Describe 'sidebar groups (Local Storage merge)' -Skip:$script:noNode {
+    It 'propagates a group created on one account into the other, in both Local Storage keys and the config mirror, with the size accounting intact' {
         $root = New-Fixture @('devA/ws1', 'devB/ws2'); $state = New-StateDir
         New-Chat (Join-Path $root 'devA/ws1') 'aaa' | Out-Null
-        $cfgPath = New-Config '{"first_launch_at":"2026-01-02T03:04:05.678Z","trusted":["C:\\one"],"preferences":{"epitaxyPrefs":{"dframe-group-scopes":{"devA/ws1":{"groups":[{"id":"cg-1","name":"grp","color":"red"}],"order":{"cg-1":["code:local_aaa"]},"pinnedOrder":["code:local_aaa"]}}}}}'
-        Invoke-Sync $root $state -ConfigPath $cfgPath
-        $after = Get-Content $cfgPath -Raw
-        $after | Should -Match '"first_launch_at":"2026-01-02T03:04:05\.678Z"'
-        $after | Should -Match '\["C:\\\\one"\]'
-        $cfg = $after | ConvertFrom-Json
-        $b = $cfg.preferences.epitaxyPrefs.'dframe-group-scopes'.'devB/ws2'
-        $b | Should -Not -BeNullOrEmpty
-        @($b.groups)[0].color | Should -Be 'red'
-        @($b.pinnedOrder) | Should -Contain 'code:local_aaa'
+        $g1 = @{ id = 'cg-1'; name = 'skole' }
+        $ldb = New-LevelDb @{
+            'devA/ws1' = New-ScopeEntry @($g1) @{ 'code:local_aaa' = 'cg-1' } @{ 'cg-1' = @('code:local_aaa') }
+            'devB/ws2' = New-ScopeEntry @()
+        } -LastScope 'devB/ws2'
+        $cfg = New-GroupConfig
+        Invoke-Sync $root $state -LevelDb $ldb -ConfigPath $cfg
+        Get-Heartbeat $state | Should -Match 'groups updated$'
+        foreach ($scope in 'devA/ws1', 'devB/ws2') {
+            $s = Get-ScopeFromStore $ldb $scope
+            @($s.groups).id | Should -Be @('cg-1')
+            $s.assignments.'code:local_aaa' | Should -Be 'cg-1'
+            @($s.order.'cg-1') | Should -Be @('code:local_aaa')
+            (Get-ScopeFromLss $ldb $scope | ConvertTo-Json -Compress -Depth 10) | Should -Be ($s | ConvertTo-Json -Compress -Depth 10)
+        }
+        (Read-LevelDbJson $ldb 'dframe-store').state.pinnedOrder | Should -Be @('code:local_pinned')   # untouched sibling state
+        $meta = Get-LevelDbMeta $ldb
+        $meta.sizeBytes | Should -Be $meta.computed
+        Join-Path $state 'groups-base.json' | Should -Exist
+        @(Get-ChildItem $state -Filter 'leveldb-backup-*' -Directory).Count | Should -Be 1
+        @(Get-ChildItem $state -Filter 'leveldb-backup-*.tmp' -Directory).Count | Should -Be 0
+        $after = Get-Content $cfg -Raw
+        $after | Should -Match '"coworkUserFilesPath": "C:\\\\Users\\\\x\\\\Cowork"'
+        $after | Should -Match '"starred-local-code-sessions": \["local_1"\]'
+        $after | Should -Match '"fastMode": \{"value": false, "tabId": ""\}'
+        $parsed = $after | ConvertFrom-Json
+        @($parsed.preferences.epitaxyPrefs.'dframe-group-scopes'.'devB/ws2'.groups)[0].name | Should -Be 'skole'
+        @($parsed.preferences.epitaxyPrefs.'dframe-group-scopes'.'devA/ws1'.groups)[0].name | Should -Be 'skole'
+        @(Get-ChildItem $state -Filter 'config-backup-*.json').Count | Should -Be 1
     }
 
-    It 'propagates a case-only group rename via the consensus tiebreak' {
+    It 'merges three-way after a base exists: a deletion on one side and a rename on the other both propagate' {
         $root = New-Fixture @('devA/ws1', 'devB/ws2'); $state = New-StateDir
         New-Chat (Join-Path $root 'devA/ws1') 'aaa' | Out-Null
-        $cfgPath = New-Config '{"preferences":{"epitaxyPrefs":{"dframe-group-scopes":{"devA/ws1":{"groups":[{"id":"cg-1","name":"work"}],"order":{}}}}}}'
-        Invoke-Sync $root $state -ConfigPath $cfgPath          # mirrors to devB, records consensus
-        Invoke-Sync $root $state -ConfigPath $cfgPath          # steady state, consensus confirmed
-        $t = Get-Content $cfgPath -Raw
-        # Ordinal: culture-sensitive IndexOf (th-TH) matches at shifted positions
-        # and would corrupt the fixture, which the engine then rightly refuses.
-        $i = $t.IndexOf('"name":"work"', [System.StringComparison]::Ordinal)
-        $t = $t.Substring(0, $i) + '"name":"Work"' + $t.Substring($i + '"name":"work"'.Length)
-        Set-Content -Path $cfgPath -Value $t -NoNewline
-        Invoke-Sync $root $state -ConfigPath $cfgPath          # divergent entry wins the tie
-        $after = Get-Content $cfgPath -Raw
-        ([regex]::Matches($after, '"name":"Work"')).Count | Should -Be 2
+        $both = @(@{ id = 'cg-1'; name = 'one' }, @{ id = 'cg-2'; name = 'two' })
+        $entry = New-ScopeEntry $both @{ 'code:local_aaa' = 'cg-1'; 'code:local_bbb' = 'cg-2' } @{ 'cg-1' = @('code:local_aaa'); 'cg-2' = @('code:local_bbb') }
+        $ldb1 = New-LevelDb @{ 'devA/ws1' = $entry; 'devB/ws2' = $entry }
+        Invoke-Sync $root $state -LevelDb $ldb1
+        Get-Heartbeat $state | Should -Match 'groups unchanged$'
+        Join-Path $state 'groups-base.json' | Should -Exist
+        # A deletes cg-1 (and its assignment); B renames cg-2.
+        $a = New-ScopeEntry @(@{ id = 'cg-2'; name = 'two' }) @{ 'code:local_bbb' = 'cg-2' } @{ 'cg-2' = @('code:local_bbb') }
+        $b = New-ScopeEntry @(@{ id = 'cg-1'; name = 'one' }, @{ id = 'cg-2'; name = 'Two!' }) @{ 'code:local_aaa' = 'cg-1'; 'code:local_bbb' = 'cg-2' } @{ 'cg-1' = @('code:local_aaa'); 'cg-2' = @('code:local_bbb') }
+        $ldb2 = New-LevelDb @{ 'devA/ws1' = $a; 'devB/ws2' = $b } -LastScope 'devB/ws2'
+        Invoke-Sync $root $state -LevelDb $ldb2
+        Get-Heartbeat $state | Should -Match 'groups updated$'
+        foreach ($scope in 'devA/ws1', 'devB/ws2') {
+            $s = Get-ScopeFromStore $ldb2 $scope
+            @($s.groups).id | Should -Be @('cg-2')
+            @($s.groups)[0].name | Should -Be 'Two!'
+            $s.assignments.PSObject.Properties.Name | Should -Not -Contain 'code:local_aaa'
+            $s.order.PSObject.Properties.Name | Should -Not -Contain 'cg-1'
+        }
     }
 
-    It 'refuses to insert a duplicate when the key exists in another escape encoding' {
+    It 'never deletes on the first merge: two accounts with different groups end up with the union' {
         $root = New-Fixture @('devA/ws1', 'devB/ws2'); $state = New-StateDir
         New-Chat (Join-Path $root 'devA/ws1') 'aaa' | Out-Null
-        $before = '{"preferences":{"epitaxyPrefs":{"dframe-group-scopes":{"devA/ws1":{"groups":[{"id":"cg-1","name":"g"}],"order":{}},"devB\u002fws2":{"groups":[]}}}}}'
-        $cfgPath = New-Config $before
-        Invoke-Sync $root $state -ConfigPath $cfgPath
-        (Get-Content $cfgPath -Raw) | Should -Be $before                      # untouched
-        Join-Path $state 'CONFIG-MIRROR-BROKEN.txt' | Should -Exist           # loudly refused
+        $ldb = New-LevelDb @{
+            'devA/ws1' = New-ScopeEntry @(@{ id = 'cg-1'; name = 'one' }) @{ 'code:local_aaa' = 'cg-1' } @{ 'cg-1' = @('code:local_aaa') }
+            'devB/ws2' = New-ScopeEntry @(@{ id = 'cg-2'; name = 'two' }) @{ 'code:local_bbb' = 'cg-2' } @{ 'cg-2' = @('code:local_bbb') }
+        } -LastScope 'devB/ws2'
+        Invoke-Sync $root $state -LevelDb $ldb
+        foreach ($scope in 'devA/ws1', 'devB/ws2') {
+            $ids = @((Get-ScopeFromStore $ldb $scope).groups).id
+            $ids | Should -Be @('cg-2', 'cg-1')                # the last-used account's order leads
+        }
     }
 
-    It 'anchors on the real preferences path, never a decoy occurrence elsewhere' {
+    It 'treats a scope the app wiped as a seed target, never as deletion evidence' {
         $root = New-Fixture @('devA/ws1', 'devB/ws2'); $state = New-StateDir
         New-Chat (Join-Path $root 'devA/ws1') 'aaa' | Out-Null
-        $cfgPath = New-Config '{"backupOfOldProfile":{"epitaxyPrefs":{"dframe-group-scopes":{"devA/ws1":{"groups":[{"id":"cg-9","name":"DECOY"}],"order":{}}}}},"preferences":{"epitaxyPrefs":{"dframe-group-scopes":{"devA/ws1":{"groups":[{"id":"cg-1","name":"real"}],"order":{}}}}}}'
-        Invoke-Sync $root $state -ConfigPath $cfgPath
-        $cfg = Get-Content $cfgPath -Raw | ConvertFrom-Json
-        $cfg.preferences.epitaxyPrefs.'dframe-group-scopes'.'devB/ws2' | Should -Not -BeNullOrEmpty
-        @($cfg.preferences.epitaxyPrefs.'dframe-group-scopes'.'devB/ws2'.groups)[0].name | Should -Be 'real'
-        $cfg.backupOfOldProfile.epitaxyPrefs.'dframe-group-scopes'.PSObject.Properties.Name | Should -Not -Contain 'devB/ws2'
+        $entry = New-ScopeEntry @(@{ id = 'cg-1'; name = 'one' }) @{ 'code:local_aaa' = 'cg-1' } @{ 'cg-1' = @('code:local_aaa') }
+        Invoke-Sync $root $state -LevelDb (New-LevelDb @{ 'devA/ws1' = $entry; 'devB/ws2' = $entry })
+        $ldb = New-LevelDb @{ 'devA/ws1' = $entry }                  # devB/ws2 vanished from the map
+        Invoke-Sync $root $state -LevelDb $ldb
+        @((Get-ScopeFromStore $ldb 'devB/ws2').groups).id | Should -Be @('cg-1')
+        @((Get-ScopeFromStore $ldb 'devA/ws1').groups).id | Should -Be @('cg-1')
     }
 
-    It 'preserves a UTF-8 BOM across a splice' {
+    It 'refuses to write while the app holds the Local Storage lock, and reports it as deferred' {
         $root = New-Fixture @('devA/ws1', 'devB/ws2'); $state = New-StateDir
         New-Chat (Join-Path $root 'devA/ws1') 'aaa' | Out-Null
-        $cfgPath = Join-Path $TestDrive ("cfg-" + [guid]::NewGuid().ToString('N').Substring(0, 8) + '.json')
-        $body = '{"preferences":{"epitaxyPrefs":{"dframe-group-scopes":{"devA/ws1":{"groups":[{"id":"cg-1","name":"g"}],"order":{}}}}}}'
-        [System.IO.File]::WriteAllText($cfgPath, $body, (New-Object System.Text.UTF8Encoding($true)))
-        Invoke-Sync $root $state -ConfigPath $cfgPath
-        $bytes = [System.IO.File]::ReadAllBytes($cfgPath)
+        $ldb = New-LevelDb @{
+            'devA/ws1' = New-ScopeEntry @(@{ id = 'cg-1'; name = 'one' })
+            'devB/ws2' = New-ScopeEntry @()
+        }
+        $holdOut = Join-Path $TestDrive ("hold-" + [guid]::NewGuid().ToString('N').Substring(0, 8) + '.txt')
+        $holder = Start-Process -FilePath $script:node -ArgumentList @('"' + $script:fixture + '"', 'hold', '"' + $ldb + '"', '20000') -PassThru -NoNewWindow -RedirectStandardOutput $holdOut
+        try {
+            $deadline = (Get-Date).AddSeconds(15)
+            while ((Get-Date) -lt $deadline -and -not ((Test-Path $holdOut) -and (Get-Content $holdOut -Raw -ErrorAction SilentlyContinue) -match 'held')) { Start-Sleep -Milliseconds 100 }
+            (Get-Content $holdOut -Raw) | Should -Match 'held'
+            # Captured after the holder opened the database: LevelDB's own open
+            # rolls the log, and that is the holder's doing, not ours.
+            $before = @(Get-ChildItem $ldb -File | ForEach-Object { "$($_.Name):$($_.Length)" }) -join ';'
+            Invoke-Sync $root $state -LevelDb $ldb
+        } finally { Stop-Process -Id $holder.Id -Force -ErrorAction SilentlyContinue; $holder.WaitForExit() }
+        Get-Heartbeat $state | Should -Match 'groups deferred$'
+        Join-Path $state 'groups-base.json' | Should -Not -Exist
+        @(Get-ChildItem $state -Filter 'leveldb-backup-*' -Directory).Count | Should -Be 0
+        (@(Get-ChildItem $ldb -File | ForEach-Object { "$($_.Name):$($_.Length)" }) -join ';') | Should -Be $before
+        @((Get-ScopeFromStore $ldb 'devB/ws2').groups).Count | Should -Be 0
+    }
+
+    It '-WhatIf reports the merge and writes nothing: no Local Storage change, no base, no backup, no config change' {
+        $root = New-Fixture @('devA/ws1', 'devB/ws2'); $state = New-StateDir
+        New-Chat (Join-Path $root 'devA/ws1') 'aaa' | Out-Null
+        $ldb = New-LevelDb @{
+            'devA/ws1' = New-ScopeEntry @(@{ id = 'cg-1'; name = 'one' })
+            'devB/ws2' = New-ScopeEntry @()
+        }
+        $cfg = New-GroupConfig
+        $cfgBefore = Get-Content $cfg -Raw
+        # Under -WhatIf the log itself is a previewed write, so the heartbeat is read from the console.
+        $out = Invoke-Sync $root $state -LevelDb $ldb -ConfigPath $cfg -WhatIf -Loud 6>&1
+        ($out | Out-String) | Should -Match 'groups would-update'
+        @((Get-ScopeFromStore $ldb 'devB/ws2').groups).Count | Should -Be 0
+        Join-Path $state 'groups-base.json' | Should -Not -Exist
+        @(Get-ChildItem $state -Filter 'leveldb-backup-*' -Directory).Count | Should -Be 0
+        (Get-Content $cfg -Raw) | Should -Be $cfgBefore
+    }
+
+    It 'preserves a UTF-8 BOM and ignores a decoy occurrence of the key outside preferences' {
+        $root = New-Fixture @('devA/ws1', 'devB/ws2'); $state = New-StateDir
+        New-Chat (Join-Path $root 'devA/ws1') 'aaa' | Out-Null
+        $ldb = New-LevelDb @{
+            'devA/ws1' = New-ScopeEntry @(@{ id = 'cg-1'; name = 'real' })
+            'devB/ws2' = New-ScopeEntry @()
+        }
+        $cfg = New-GroupConfig -Bom -Decoy
+        Invoke-Sync $root $state -LevelDb $ldb -ConfigPath $cfg
+        $bytes = [System.IO.File]::ReadAllBytes($cfg)
         ($bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF) | Should -BeTrue
-        { Get-Content $cfgPath -Raw | ConvertFrom-Json } | Should -Not -Throw
+        $parsed = Get-Content $cfg -Raw | ConvertFrom-Json
+        @($parsed.backupOfOldProfile.epitaxyPrefs.'dframe-group-scopes'.'devA/ws1'.groups)[0].name | Should -Be 'DECOY'
+        $parsed.backupOfOldProfile.epitaxyPrefs.'dframe-group-scopes'.PSObject.Properties.Name | Should -Not -Contain 'devB/ws2'
+        @($parsed.preferences.epitaxyPrefs.'dframe-group-scopes'.'devB/ws2'.groups)[0].name | Should -Be 'real'
     }
 
-    It '-WhatIf leaves the config untouched' {
+    It 'keeps the config mirror in step on a later run even when the merge itself has nothing to change' {
         $root = New-Fixture @('devA/ws1', 'devB/ws2'); $state = New-StateDir
         New-Chat (Join-Path $root 'devA/ws1') 'aaa' | Out-Null
-        $cfgPath = New-Config '{"preferences":{"epitaxyPrefs":{"dframe-group-scopes":{"devA/ws1":{"groups":[{"id":"cg-9","name":"g"}],"order":{}}}}}}'
-        $before = Get-Content $cfgPath -Raw
-        Invoke-Sync $root $state -WhatIf -ConfigPath $cfgPath
-        (Get-Content $cfgPath -Raw) | Should -Be $before
+        $entry = New-ScopeEntry @(@{ id = 'cg-1'; name = 'one' })
+        $ldb = New-LevelDb @{ 'devA/ws1' = $entry; 'devB/ws2' = $entry }
+        $cfg = New-GroupConfig                                  # mirror is behind: devB/ws2 missing, devA/ws1 empty
+        Invoke-Sync $root $state -LevelDb $ldb -ConfigPath $cfg
+        Get-Heartbeat $state | Should -Match 'groups mirrored$'
+        $parsed = Get-Content $cfg -Raw | ConvertFrom-Json
+        @($parsed.preferences.epitaxyPrefs.'dframe-group-scopes'.'devB/ws2'.groups)[0].id | Should -Be 'cg-1'
+    }
+
+    It 'reports groups off, and still syncs chats, when the helper is missing' {
+        $root = New-Fixture @('devA/ws1', 'devB/ws2'); $state = New-StateDir
+        New-Chat (Join-Path $root 'devA/ws1') 'aaa' | Out-Null
+        $ldb = New-LevelDb @{ 'devA/ws1' = New-ScopeEntry @(@{ id = 'cg-1'; name = 'one' }); 'devB/ws2' = New-ScopeEntry @() }
+        Invoke-Sync $root $state -LevelDb $ldb -HelperDir (Join-Path $TestDrive 'no-helper')
+        Get-Heartbeat $state | Should -Match 'groups off$'
+        Join-Path $root 'devB/ws2/local_aaa.json' | Should -Exist
+        @((Get-ScopeFromStore $ldb 'devB/ws2').groups).Count | Should -Be 0
+    }
+}
+
+Describe 'MSIX shadow refusal' {
+    It 'refuses to run when the state dir it sees is a package shadow, and touches nothing' {
+        $root = New-Fixture @('devA/ws1', 'devB/ws2'); $state = New-StateDir
+        New-Chat (Join-Path $root 'devA/ws1') 'aaa' | Out-Null
+        # A junction makes a file written into the state dir show up under a
+        # package's LocalCache mirror of it: exactly what the probe detects.
+        $packages = Join-Path $TestDrive ("pk-" + [guid]::NewGuid().ToString('N').Substring(0, 8))
+        $mirrorParent = Join-Path $packages 'SomeApp_abc123\LocalCache\Local'
+        New-Item -ItemType Directory -Force -Path $mirrorParent | Out-Null
+        $junction = Join-Path $mirrorParent (Split-Path $state -Leaf)
+        New-Item -ItemType Junction -Path $junction -Target $state | Out-Null
+        try {
+            $out = Invoke-Sync $root $state -PackagesRoot $packages 6>&1
+            $LASTEXITCODE | Should -Be 2
+            ($out | Out-String) | Should -Match 'refused: this process sees an MSIX shadow'
+        } finally { [System.IO.Directory]::Delete($junction, $false) }
+        Join-Path $root 'devB/ws2/local_aaa.json' | Should -Not -Exist
+        Join-Path $state 'sync-log.txt' | Should -Not -Exist
+        @(Get-ChildItem $state -Filter '.virt-probe-*' -Force).Count | Should -Be 0
+    }
+
+    It 'runs normally when no package mirrors the state dir' {
+        $root = New-Fixture @('devA/ws1', 'devB/ws2'); $state = New-StateDir
+        New-Chat (Join-Path $root 'devA/ws1') 'aaa' | Out-Null
+        $packages = Join-Path $TestDrive ("pk-" + [guid]::NewGuid().ToString('N').Substring(0, 8))
+        New-Item -ItemType Directory -Force -Path (Join-Path $packages 'SomeApp_abc123\LocalCache\Local') | Out-Null
+        Invoke-Sync $root $state -PackagesRoot $packages
+        Join-Path $root 'devB/ws2/local_aaa.json' | Should -Exist
+        @(Get-ChildItem $state -Filter '.virt-probe-*' -Force).Count | Should -Be 0
     }
 }
