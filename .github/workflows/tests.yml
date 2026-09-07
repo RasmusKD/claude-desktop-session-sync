@@ -10,13 +10,24 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install the group-sync helper dependency
+        shell: pwsh
+        run: |
+          Push-Location group-sync
+          npm ci --omit=dev --no-audit --no-fund
+          Pop-Location
+
       - name: Tests on Windows PowerShell 5.1
         shell: powershell
         run: |
           Install-Module Pester -Force -Scope CurrentUser -SkipPublisherCheck -RequiredVersion 5.7.1
           Import-Module Pester -RequiredVersion 5.7.1
           $r = Invoke-Pester -Path tests -CI -PassThru
-          if ($r.FailedCount -gt 0 -or $r.Result -ne 'Passed') { exit 1 }
+          if ($r.FailedCount -gt 0 -or $r.SkippedCount -gt 0 -or $r.Result -ne 'Passed') { exit 1 }
 
       - name: Tests on PowerShell 7
         shell: pwsh
@@ -24,7 +35,7 @@ jobs:
           Install-Module Pester -Force -Scope CurrentUser -SkipPublisherCheck -RequiredVersion 5.7.1
           Import-Module Pester -RequiredVersion 5.7.1
           $r = Invoke-Pester -Path tests -CI -PassThru
-          if ($r.FailedCount -gt 0 -or $r.Result -ne 'Passed') { exit 1 }
+          if ($r.FailedCount -gt 0 -or $r.SkippedCount -gt 0 -or $r.Result -ne 'Passed') { exit 1 }
 
       - name: Tests under non-invariant cultures (tr-TR, th-TH) on PowerShell 7
         shell: pwsh
@@ -35,7 +46,7 @@ jobs:
             [System.Threading.Thread]::CurrentThread.CurrentCulture = $culture
             [System.Threading.Thread]::CurrentThread.CurrentUICulture = $culture
             $r = Invoke-Pester -Path tests -CI -PassThru
-            if ($r.FailedCount -gt 0 -or $r.Result -ne 'Passed') { Write-Host "FAILED under $culture"; exit 1 }
+            if ($r.FailedCount -gt 0 -or $r.SkippedCount -gt 0 -or $r.Result -ne 'Passed') { Write-Host "FAILED under $culture"; exit 1 }
           }
 
       - name: Tests under non-invariant cultures (tr-TR, th-TH) on Windows PowerShell 5.1
@@ -47,5 +58,5 @@ jobs:
             [System.Threading.Thread]::CurrentThread.CurrentCulture = $culture
             [System.Threading.Thread]::CurrentThread.CurrentUICulture = $culture
             $r = Invoke-Pester -Path tests -CI -PassThru
-            if ($r.FailedCount -gt 0 -or $r.Result -ne 'Passed') { Write-Host "FAILED under $culture"; exit 1 }
+            if ($r.FailedCount -gt 0 -or $r.SkippedCount -gt 0 -or $r.Result -ne 'Passed') { Write-Host "FAILED under $culture"; exit 1 }
           }

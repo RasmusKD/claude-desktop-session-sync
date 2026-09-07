@@ -1,0 +1,13 @@
+{
+  "name": "claude-desktop-session-sync-groups",
+  "private": true,
+  "version": "0.6.0",
+  "description": "Sidebar-group merge helper for claude-desktop-session-sync (opens the app's Local Storage LevelDB with a real LevelDB implementation).",
+  "type": "module",
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "classic-level": "2.0.0"
+  }
+}
