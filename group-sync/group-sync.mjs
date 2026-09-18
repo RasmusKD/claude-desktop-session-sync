@@ -10,10 +10,22 @@
 //  - backup-first: the LevelDB directory is copied BEFORE it is opened for a
 //    write, and the config file is copied before it is spliced.
 //  - the merge is three-way against the last synced result (the base): a group
-//    that is absent from a scope which was synced before is a deletion, a group
-//    the base never held is an addition, and a scope the base never saw (a new
-//    account, or one the app wiped) contributes additions only. Without a base
-//    nothing is ever deleted.
+//    the base never held is an addition, and a group is a deletion only when a
+//    scope lacks it AFTER that scope was last seen reconciled with its account's
+//    server row (see below). A deleted id is tombstoned and never re-added.
+//    Without a base nothing is ever deleted.
+//  - each account's group list is authoritative on claude.ai, and Local Storage
+//    is only a cache of it: at every app start the store is reconciled with the
+//    current account's row, the server list replaces the local one and
+//    local-session assignments to groups off that list are dropped. Switching
+//    accounts reconciles the same way. The one exception is the pending marker
+//    (ccd-sync-pending:ccd/dframe-store) naming the account the app starts on,
+//    which makes the app push the local state instead. So a write into a scope
+//    only reaches that account once the app has started on it with the marker
+//    set, and a scope lacking a group is evidence of a user deletion only when
+//    the account's server row was known to hold it. groups-base.json tracks per
+//    scope the entry last seen reconciled (published) and the entry written
+//    under a marker (pending); Local Storage keeps no such history.
 //  - the config mirror is an OUTPUT only. The app writes it from Local Storage,
 //    so reading it back as evidence would resurrect whatever the app last
 //    flushed; every byte outside the spliced value survives verbatim.
@@ -26,6 +38,14 @@ const ORIGIN = 'https://claude.ai';
 const SCOPES_KEY = 'LSS-persisted.dframe-group-scopes';
 const STORE_KEY = 'dframe-store';
 const CONFIG_PATH = ['preferences', 'epitaxyPrefs', 'dframe-group-scopes'];
+// Server-sync bookkeeping the app keeps beside the store: the account whose row
+// was reconciled last, the push-instead-of-pull marker (value = account/org),
+// and the keys the app stamps on logout and on a confirmed login, which date
+// the last account switch (a switch discards the marker without pushing).
+const SYNC_OWNER_KEY = 'ccd-sync-owner';
+const SYNC_PENDING_KEY = 'ccd-sync-pending:ccd/dframe-store';
+const SESSION_MARKER_KEY = 'rq-cache-confirmed-session-marker';
+const LOGOUT_KEY = /-logout-at$/;
 const LEVELDB_BACKUPS_KEPT = 5;
 const CONFIG_BACKUPS_KEPT = 5;
 
@@ -143,19 +163,22 @@ const deepEqual = (a, b) => JSON.stringify(canon(a)) === JSON.stringify(canon(b)
 const uniq = (xs) => [...new Set(xs)];
 
 // scopes: the keys to equalize. present: scope -> entry actually found in Local
-// Storage (absent scopes are seed targets). base: { scopes, entry } from the last
-// sync, or null. prefer: scope order used to break ties (most recent first).
-export function mergeScopes(scopes, present, base, prefer) {
+// Storage (absent scopes are seed targets). base: { entry, tombstones } from the
+// last sync, or null. prefer: scope order used to break ties (most recent
+// first). reconciled: scope -> the entry that scope was last known to hold after
+// the app reconciled it with its account's server row; only a departure from
+// that entry is a user edit, everything else a scope can lack is what the server
+// merge discarded, and a scope with no such entry contributes additions only.
+export function mergeScopes(scopes, present, base, prefer, reconciled = {}) {
   const pref = uniq([...prefer.filter((s) => scopes.includes(s)), ...scopes]);
   const b = normalizeEntry(base ? base.entry : null);
-  const baseScopes = new Set(base ? base.scopes : []);
+  const tombstones = base && base.tombstones && typeof base.tombstones === 'object' ? base.tombstones : {};
   const cur = {};
   for (const s of pref) if (present[s]) cur[s] = normalizeEntry(present[s]);
   const presentScopes = pref.filter((s) => cur[s]);
-  // Deletion evidence comes only from scopes that were synced before AND are
-  // present now: a newcomer or a wiped scope cannot "lack" anything.
-  const evidence = presentScopes.filter((s) => baseScopes.has(s));
-  const changes = { groupsAdded: [], groupsRemoved: [], groupsChanged: [], assignmentsChanged: 0 };
+  const known = {};
+  for (const s of presentScopes) if (reconciled[s]) known[s] = normalizeEntry(reconciled[s]);
+  const changes = { groupsAdded: [], groupsRemoved: [], groupsChanged: [], groupsWithheld: [], assignmentsChanged: 0 };
 
   const baseGroups = new Map(b.groups.map((g) => [g.id, g]));
   const ids = uniq([...b.groups.map((g) => g.id), ...presentScopes.flatMap((s) => cur[s].groups.map((g) => g.id))]);
@@ -163,8 +186,15 @@ export function mergeScopes(scopes, present, base, prefer) {
   for (const id of ids) {
     const inBase = baseGroups.get(id);
     const holders = presentScopes.filter((s) => cur[s].groups.some((g) => g.id === id));
+    // A deleted id never returns: an account that has not logged in since the
+    // deletion still carries it in its server row and hands it back on relog.
+    if (Object.prototype.hasOwnProperty.call(tombstones, id)) { if (holders.length > 0) changes.groupsWithheld.push(id); continue; }
     if (inBase) {
-      if (evidence.some((s) => !holders.includes(s))) { changes.groupsRemoved.push(id); continue; }
+      const deletedBy = presentScopes.find((s) => !holders.includes(s) && known[s] && known[s].groups.some((g) => g.id === id));
+      if (deletedBy) { changes.groupsRemoved.push(id); continue; }
+      // The base is memory, not a source: a group no scope holds any more is
+      // gone from every account and is not resurrected from the last sync.
+      if (holders.length === 0) { changes.groupsWithheld.push(id); continue; }
       const changed = holders.map((s) => cur[s].groups.find((g) => g.id === id)).find((g) => !deepEqual(g, inBase));
       if (changed) changes.groupsChanged.push(id);
       merged.set(id, changed ?? inBase);
@@ -190,7 +220,9 @@ export function mergeScopes(scopes, present, base, prefer) {
     const baseVal = b.assignments[key];
     let val;
     if (baseVal !== undefined) {
-      const mover = presentScopes.find((s) => cur[s].assignments[key] !== baseVal && (holdsKey(cur[s], key) || evidence.includes(s)));
+      // A scope moves the chat when it assigns it elsewhere, or when it lacks an
+      // assignment its reconciled entry held (the user removed it there).
+      const mover = presentScopes.find((s) => cur[s].assignments[key] !== baseVal && (holdsKey(cur[s], key) || (known[s] && known[s].assignments[key] === baseVal)));
       val = mover ? cur[mover].assignments[key] : baseVal;
     } else {
       const adder = presentScopes.find((s) => cur[s].assignments[key] !== undefined);
@@ -224,6 +256,16 @@ export function mergeScopes(scopes, present, base, prefer) {
     for (const [k, v] of Object.entries(cur[s])) if (!['groups', 'assignments', 'order'].includes(k)) extras[k] = v;
   }
   return { entry: { ...extras, groups, assignments, order }, changes };
+}
+
+// The LSS wrapper is the app's pruned projection of the store (assignments to
+// unknown groups and groups nobody references are dropped), so it legitimately
+// holds less than the store. It holds MORE only when the two have diverged.
+function lssExceedsStore(lss, store) {
+  const l = normalizeEntry(lss); const s = normalizeEntry(store);
+  const ids = new Set(s.groups.map((g) => g.id));
+  if (l.groups.some((g) => !ids.has(g.id))) return true;
+  return Object.entries(l.assignments).some(([k, v]) => ids.has(v) && s.assignments[k] !== v);
 }
 
 function holdsKey(entry, key) { return Object.prototype.hasOwnProperty.call(entry.assignments, key); }
@@ -350,11 +392,13 @@ async function snapshotLevelDb(src, dest) {
 // ── Main ─────────────────────────────────────────────────────────────────────
 async function main() {
   const args = parseArgs(process.argv.slice(2));
-  const result = { status: 'unchanged', configState: 'skipped', warnings: [], changes: null, scopesRewritten: [] };
+  const result = { status: 'unchanged', configState: 'skipped', warnings: [], changes: null, scopesRewritten: [], publish: null };
   await fs.mkdir(args.state, { recursive: true });
   const basePath = path.join(args.state, 'groups-base.json');
   let base = null;
   try { base = JSON.parse(await fs.readFile(basePath, 'utf8')); if (!base || !Array.isArray(base.scopes) || !base.entry) base = null; } catch (e) { if (e.code !== 'ENOENT') result.warnings.push(`base unreadable (${e.message}); merging without deletions`); }
+  const published = base && base.published && typeof base.published === 'object' ? base.published : {};
+  const pendingWrites = base && base.pending && typeof base.pending === 'object' ? base.pending : {};
 
   const stamp = new Date().toISOString().replace(/[-:]/g, '').replace(/\..*/, '').replace('T', '-');
   const snapshot = path.join(args.state, `leveldb-backup-${stamp}-${process.pid}.tmp`);
@@ -386,27 +430,79 @@ async function main() {
     if (!fromLss && !fromStore) { result.status = 'unchanged'; result.reason = 'group keys present but hold no scopes'; return result; }
 
     // The zustand store is what the sidebar hydrates from; the LSS wrapper is the
-    // app's own mirror of it. They agree in every observed state; a disagreement
-    // is reported and the store wins.
+    // app's projection of it and is only reported when it holds more.
     const present = {};
     for (const s of args.scopes) {
       const a = fromStore ? fromStore[s] : undefined;
       const b = fromLss ? fromLss[s] : undefined;
-      if (a !== undefined && b !== undefined && !deepEqual(a, b)) result.warnings.push(`scope ${s}: store and LSS mirror disagree; store wins`);
+      if (a !== undefined && b !== undefined && lssExceedsStore(b, a)) result.warnings.push(`scope ${s}: LSS mirror holds groups the store lacks; store wins`);
       const chosen = a !== undefined ? a : b;
       if (chosen !== undefined) present[s] = chosen;
     }
-    const prefer = [];
-    if (store && store.state && typeof store.state.lastSidebarScopeKey === 'string') prefer.push(store.state.lastSidebarScopeKey);
-    const { entry, changes } = mergeScopes(args.scopes, present, base, prefer);
+    const lastScope = store && store.state && typeof store.state.lastSidebarScopeKey === 'string' ? store.state.lastSidebarScopeKey : undefined;
+    const prefer = lastScope ? [lastScope] : [];
+
+    const readText = (name) => { const r = origin.entries.get(name); return r ? decodeString(r.value) : undefined; };
+    const owner = readText(SYNC_OWNER_KEY);
+    const marker = readText(SYNC_PENDING_KEY);
+    let switchedAt = 0;
+    for (const [name, rec] of origin.entries) {
+      if (!LOGOUT_KEY.test(name) && name !== SESSION_MARKER_KEY) continue;
+      const at = Number(decodeString(rec.value));
+      if (Number.isFinite(at) && at > switchedAt) switchedAt = at;
+    }
+    const account = (s) => s.split('/')[0];
+    // The scope the app will reconcile at its next start: the owner account, in
+    // the org it showed last when that account has several.
+    const ownerScope = owner === undefined ? undefined : (args.scopes.find((s) => s === lastScope && account(s) === owner) ?? args.scopes.find((s) => account(s) === owner));
+    // A scope's entry is reconciled when the app has run on its account since the
+    // last write to it: the owner scope with no marker outstanding. Without
+    // server sync (no owner key) every present scope is what the app shows.
+    const reconciledNow = (s) => present[s] !== undefined && (owner === undefined || (s === ownerScope && marker === undefined));
+    const reconciled = {};
+    for (const s of args.scopes) {
+      if (!reconciledNow(s)) continue;
+      const p = pendingWrites[s];
+      // A write of ours counts as reconciled once the app has pushed it: the
+      // marker is gone and no account switch (which discards it unpushed) has
+      // happened since. Without a dated switch the push is not assumed.
+      const pushed = p && p.entry && switchedAt > 0 && switchedAt < Date.parse(p.at);
+      if (pushed) reconciled[s] = p.entry;
+      else if (published[s] && published[s].entry) reconciled[s] = published[s].entry;
+    }
+    const { entry, changes } = mergeScopes(args.scopes, present, base, prefer, reconciled);
     result.changes = changes;
     const rewritten = args.scopes.filter((s) => !deepEqual(present[s], entry));
     result.scopesRewritten = rewritten;
-    const baseMatches = base && deepEqual(base.entry, entry) && deepEqual([...base.scopes].sort(), [...args.scopes].sort());
-    if (rewritten.length === 0 && baseMatches) {
-      result.status = 'unchanged';
-    } else if (args.dryRun) {
-      result.status = 'would-update';
+
+    const now = new Date().toISOString();
+    const publishedOut = {};
+    const pendingOut = {};
+    for (const s of args.scopes) {
+      if (reconciledNow(s)) publishedOut[s] = { at: now, entry: present[s] };
+      else { if (published[s]) publishedOut[s] = published[s]; if (pendingWrites[s]) pendingOut[s] = pendingWrites[s]; }
+    }
+    const tombstones = { ...(base && base.tombstones && typeof base.tombstones === 'object' ? base.tombstones : {}) };
+    for (const id of changes.groupsRemoved) tombstones[id] = now;
+    // A tombstone stays until every account has been seen reconciled after the
+    // deletion, so the id can no longer come back from a server row.
+    for (const [id, at] of Object.entries(tombstones)) {
+      const held = args.scopes.some((s) => present[s] !== undefined && normalizeEntry(present[s]).groups.some((g) => g.id === id));
+      if (!held && args.scopes.every((s) => publishedOut[s] && publishedOut[s].at > at)) delete tombstones[id];
+    }
+    // The owner scope reaches its server row only through the app's push, so the
+    // marker is set whenever what it holds after this run is not what the server
+    // was last seen to hold. A marker the app wrote for another identity (a seed
+    // migration) is not touched.
+    const ownerNeedsPush = ownerScope !== undefined && !(publishedOut[ownerScope] && deepEqual(publishedOut[ownerScope].entry, entry));
+    const markerWrite = ownerNeedsPush && marker === undefined;
+    result.publish = { owner: ownerScope ?? null, marker: ownerScope === undefined ? 'none' : markerWrite ? 'set' : marker === undefined ? 'current' : marker === ownerScope ? 'kept' : 'foreign' };
+    if (ownerNeedsPush && marker !== undefined && marker !== ownerScope) result.warnings.push(`pending marker names ${marker}; the app will not push ${ownerScope} until it clears`);
+    if (ownerNeedsPush) pendingOut[ownerScope] = { at: now, entry };
+
+    const dbWrite = rewritten.length > 0 || markerWrite;
+    if (args.dryRun) {
+      result.status = dbWrite ? 'would-update' : 'unchanged';
     } else {
       const ops = [];
       let sizeDelta = 0;
@@ -431,18 +527,24 @@ async function main() {
         sizeDelta += (key.length - origin.prefix.length) + value.length;
         ops.push({ type: 'put', key, value });
       }
+      if (markerWrite) {
+        const key = Buffer.concat([origin.prefix, encodeString(SYNC_PENDING_KEY)]);
+        const value = encodeString(ownerScope);
+        sizeDelta += (key.length - origin.prefix.length) + value.length;
+        ops.push({ type: 'put', key, value });
+      }
       const meta = origin.meta ?? { lastModifiedUs: 0n, sizeBytes: BigInt(origin.sizeBytes) };
       meta.sizeBytes = BigInt(origin.sizeBytes + sizeDelta);
       meta.lastModifiedUs = BigInt(Date.now()) * 1000n + WINDOWS_EPOCH_OFFSET_US;
       ops.push({ type: 'put', key: origin.metaKey, value: encodeMeta(meta) });
-      if (rewritten.length > 0) {
+      if (dbWrite) {
         await db.batch(ops);
         result.status = 'updated';
         snapshotKept = true;
       } else {
         result.status = 'unchanged';
       }
-      const baseOut = { version: 1, scopes: [...args.scopes], entry, writtenAt: new Date().toISOString() };
+      const baseOut = { version: 2, scopes: [...args.scopes], entry, writtenAt: now, published: publishedOut, pending: pendingOut, tombstones };
       const tmp = `${basePath}.cs-tmp-${process.pid}`;
       await fs.writeFile(tmp, JSON.stringify(baseOut, null, 2));
       await fs.rename(tmp, basePath);
@@ -458,9 +560,14 @@ async function main() {
   } finally {
     if (db.status === 'open') await db.close();
     if (snapshotKept) {
-      await fs.rename(snapshot, snapshot.replace(/-\d+\.tmp$/, ''));
-      await rotate(args.state, /^leveldb-backup-\d{8}-\d{6}$/, LEVELDB_BACKUPS_KEPT);
-      result.backupDir = snapshot.replace(/-\d+\.tmp$/, '');
+      // The stamp is second-resolution; a second write within that second keeps
+      // its own backup under a numbered name instead of failing the rename.
+      const base = snapshot.replace(/-\d+\.tmp$/, '');
+      let dest = base;
+      for (let i = 2; ; i++) { try { await fs.access(dest); dest = `${base}-${i}`; } catch { break; } }
+      await fs.rename(snapshot, dest);
+      await rotate(args.state, /^leveldb-backup-\d{8}-\d{6}(-\d+)?$/, LEVELDB_BACKUPS_KEPT);
+      result.backupDir = dest;
     } else {
       await fs.rm(snapshot, { recursive: true, force: true });
     }

@@ -63,7 +63,8 @@ if (cmd === 'create') {
   await db.open();
   try {
     const v = await db.get(Buffer.concat([prefix, encodeString(arg)]));
-    process.stdout.write(decodeString(v));
+    // abstract-level 2 resolves undefined for a missing key; older majors threw.
+    process.stdout.write(v === undefined ? '' : decodeString(v));
   } catch (e) {
     if (e.code !== 'LEVEL_NOT_FOUND') throw e;
     process.stdout.write('');

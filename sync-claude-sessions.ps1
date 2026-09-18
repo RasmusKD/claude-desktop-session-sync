@@ -44,7 +44,7 @@ param(
     [string]$PackagesRootOverride # unsupported test hook: MSIX packages root for the shadow probe
 )
 $ErrorActionPreference = 'Continue'
-$ToolVersion = '0.6.0'
+$ToolVersion = '0.7.0'
 $ManifestMaxAgeDays = 7
 $StashRetentionDays = 30
 . "$PSScriptRoot\common.ps1"
@@ -487,7 +487,7 @@ if (@($activeTargets).Count -ge 2 -and $sourceSet.Count -ge 1) {
         } else {
             foreach ($w in @($res.warnings)) { if ($w) { Log "warning: groups: $w" } }
             switch ($res.status) {
-                'updated'      { $groupsState = 'updated'; Log "groups merged into $(@($res.scopesRewritten).Count) scope(s): +$(@($res.changes.groupsAdded).Count) -$(@($res.changes.groupsRemoved).Count) ~$(@($res.changes.groupsChanged).Count) group(s), $($res.changes.assignmentsChanged) assignment(s); backup $($res.backupDir); config $($res.configState)" }
+                'updated'      { $groupsState = 'updated'; Log "groups merged into $(@($res.scopesRewritten).Count) scope(s): +$(@($res.changes.groupsAdded).Count) -$(@($res.changes.groupsRemoved).Count) ~$(@($res.changes.groupsChanged).Count) group(s), $(@($res.changes.groupsWithheld).Count) withheld, $($res.changes.assignmentsChanged) assignment(s); publish $($res.publish.marker) for $($res.publish.owner); backup $($res.backupDir); config $($res.configState)" }
                 'would-update' { $groupsState = 'would-update'; Log "groups would be merged into $(@($res.scopesRewritten).Count) scope(s) (-WhatIf)" }
                 'unchanged'    { $groupsState = if ($res.configState -eq 'updated') { 'mirrored' } else { 'unchanged' } }
                 'deferred'     { $groupsState = 'deferred' }

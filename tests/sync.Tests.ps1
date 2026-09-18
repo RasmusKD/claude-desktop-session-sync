@@ -67,7 +67,9 @@ BeforeAll {
     function New-ScopeEntry([object[]]$Groups, [hashtable]$Assignments = @{}, [hashtable]$Order = @{}) {
         @{ groups = @($Groups); assignments = $Assignments; order = $Order }
     }
-    function New-LevelDb([hashtable]$Scopes, [string]$LastScope = '') {
+    # Extra: further Local Storage keys, e.g. the app's server-sync bookkeeping
+    # (ccd-sync-owner, the logout stamp). A string value is stored verbatim.
+    function New-LevelDb([hashtable]$Scopes, [string]$LastScope = '', [hashtable]$Extra = @{}) {
         $dir = Join-Path $TestDrive ("ldb-" + [guid]::NewGuid().ToString('N').Substring(0, 8))
         $entries = @{
             'dframe-store' = @{ state = @{ collapsed = $false; pinnedOrder = @('code:local_pinned'); collapsedGroups = @(); customGroupsByScope = $Scopes; lastSidebarScopeKey = $LastScope }; version = 1 }
@@ -75,6 +77,7 @@ BeforeAll {
             'LSS-persisted.dframe-local-slice' = @{ value = @{ pinnedOrder = @('code:local_pinned'); homeProjectsPinnedOrder = @() }; tabId = ''; timestamp = 1788766673184 }
             'spa:locale' = 'en-US'
         }
+        foreach ($k in $Extra.Keys) { $entries[$k] = $Extra[$k] }
         $json = Join-Path $TestDrive ("ldb-entries-" + [guid]::NewGuid().ToString('N').Substring(0, 8) + '.json')
         [System.IO.File]::WriteAllText($json, ($entries | ConvertTo-Json -Depth 30 -Compress), (New-Object System.Text.UTF8Encoding($false)))
         & $script:node $script:fixture create $dir $json | Out-Null
@@ -86,6 +89,11 @@ BeforeAll {
         if ($LASTEXITCODE -ne 0) { throw "fixture read failed" }
         if (-not $out) { return $null }
         $out | ConvertFrom-Json
+    }
+    function Read-LevelDbText([string]$Dir, [string]$Name) {
+        $out = (& $script:node $script:fixture read $Dir $Name) -join "`n"
+        if ($LASTEXITCODE -ne 0) { throw "fixture read failed" }
+        $out
     }
     function Get-LevelDbMeta([string]$Dir) { ((& $script:node $script:fixture meta $Dir) -join '') | ConvertFrom-Json }
     function Get-ScopeFromStore($Dir, $Scope) { (Read-LevelDbJson $Dir 'dframe-store').state.customGroupsByScope.$Scope }
@@ -317,6 +325,74 @@ Describe 'sidebar groups (Local Storage merge)' -Skip:$script:noNode {
             $s.assignments.PSObject.Properties.Name | Should -Not -Contain 'code:local_aaa'
             $s.order.PSObject.Properties.Name | Should -Not -Contain 'cg-1'
         }
+    }
+
+    It 'carries a group with members across a relog: the server merge that dropped it is not a deletion, the app is told to push, and a deletion made after the push still propagates' {
+        $root = New-Fixture @('devA/ws1', 'devB/ws2'); $state = New-StateDir
+        New-Chat (Join-Path $root 'devA/ws1') 'aaa' | Out-Null
+        New-Chat (Join-Path $root 'devA/ws1') 'bbb' | Out-Null
+        $skole = New-ScopeEntry @(@{ id = 'cg-skole'; name = 'skole' }) @{ 'code:local_aaa' = 'cg-skole'; 'code:local_bbb' = 'cg-skole' } @{ 'cg-skole' = @('code:local_aaa', 'code:local_bbb') }
+        $collect = New-ScopeEntry @(@{ id = 'cg-collect'; name = 'collect' })
+        $switchBefore = [string]([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() - 60000)
+        # 1. The app last ran on A, which created skole; B's row on the server holds collect only.
+        $ldb1 = New-LevelDb @{ 'devA/ws1' = $skole; 'devB/ws2' = $collect } -LastScope 'devA/ws1' -Extra @{ 'ccd-sync-owner' = 'devA'; 'epitaxy-context-usage-logout-at' = $switchBefore }
+        Invoke-Sync $root $state -LevelDb $ldb1
+        Get-Heartbeat $state | Should -Match 'groups updated$'
+        foreach ($scope in 'devA/ws1', 'devB/ws2') { @((Get-ScopeFromStore $ldb1 $scope).groups).id | Sort-Object | Should -Be @('cg-collect', 'cg-skole') }
+        Read-LevelDbText $ldb1 'ccd-sync-pending:ccd/dframe-store' | Should -Be 'devA/ws1'   # A pushes its local state at the next start
+        $merged = Get-ScopeFromStore $ldb1 'devA/ws1'
+        # 2. The user relogs into B: the switch discards the marker unpushed, and B's
+        #    server row replaces B's local list, dropping skole and its two members.
+        $switchAfter = [string]([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds())
+        $ldb2 = New-LevelDb @{ 'devA/ws1' = $merged; 'devB/ws2' = $collect } -LastScope 'devB/ws2' -Extra @{ 'ccd-sync-owner' = 'devB'; 'epitaxy-context-usage-logout-at' = $switchAfter }
+        Invoke-Sync $root $state -LevelDb $ldb2
+        Get-Heartbeat $state | Should -Match 'groups updated$'
+        (Get-Content (Join-Path $state 'sync-log.txt') -Tail 2)[0] | Should -Match '\+0 -0 ~0 group\(s\), 0 withheld'
+        $b = Get-ScopeFromStore $ldb2 'devB/ws2'
+        @($b.groups).id | Sort-Object | Should -Be @('cg-collect', 'cg-skole')
+        $b.assignments.'code:local_aaa' | Should -Be 'cg-skole'
+        $b.assignments.'code:local_bbb' | Should -Be 'cg-skole'
+        @($b.order.'cg-skole') | Should -Be @('code:local_aaa', 'code:local_bbb')
+        @((Get-ScopeFromStore $ldb2 'devA/ws1').groups).id | Sort-Object | Should -Be @('cg-collect', 'cg-skole')
+        Read-LevelDbText $ldb2 'ccd-sync-pending:ccd/dframe-store' | Should -Be 'devB/ws2'
+        $base = Get-Content (Join-Path $state 'groups-base.json') -Raw | ConvertFrom-Json
+        @($base.tombstones.PSObject.Properties).Count | Should -Be 0
+        $base.pending.'devB/ws2'.entry.groups.id | Should -Contain 'cg-skole'
+        # 3. The app started on B and pushed (marker gone, no switch since), then the
+        #    user deleted skole on B. That deletion is real and reaches A.
+        $ldb3 = New-LevelDb @{ 'devA/ws1' = $merged; 'devB/ws2' = $collect } -LastScope 'devB/ws2' -Extra @{ 'ccd-sync-owner' = 'devB'; 'epitaxy-context-usage-logout-at' = $switchAfter }
+        Invoke-Sync $root $state -LevelDb $ldb3
+        Get-Heartbeat $state | Should -Match 'groups updated$'
+        @((Get-ScopeFromStore $ldb3 'devA/ws1').groups).id | Should -Be @('cg-collect')
+        (Get-ScopeFromStore $ldb3 'devA/ws1').assignments.PSObject.Properties.Name | Should -Not -Contain 'code:local_aaa'
+        Read-LevelDbText $ldb3 'ccd-sync-pending:ccd/dframe-store' | Should -BeNullOrEmpty       # B's server row already lacks it
+        $base = Get-Content (Join-Path $state 'groups-base.json') -Raw | ConvertFrom-Json
+        $base.tombstones.PSObject.Properties.Name | Should -Contain 'cg-skole'
+        # 4. A relogs and its stale server row hands skole back: the tombstone withholds it.
+        $ldb4 = New-LevelDb @{ 'devA/ws1' = $merged; 'devB/ws2' = $collect } -LastScope 'devA/ws1' -Extra @{ 'ccd-sync-owner' = 'devA'; 'epitaxy-context-usage-logout-at' = [string]([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()) }
+        Invoke-Sync $root $state -LevelDb $ldb4
+        @((Get-ScopeFromStore $ldb4 'devA/ws1').groups).id | Should -Be @('cg-collect')
+        Read-LevelDbText $ldb4 'ccd-sync-pending:ccd/dframe-store' | Should -Be 'devA/ws1'
+    }
+
+    It 'does not read a write the app discarded at an account switch as a deletion' {
+        $root = New-Fixture @('devA/ws1', 'devB/ws2'); $state = New-StateDir
+        New-Chat (Join-Path $root 'devA/ws1') 'aaa' | Out-Null
+        $skole = New-ScopeEntry @(@{ id = 'cg-skole'; name = 'skole' }) @{ 'code:local_aaa' = 'cg-skole' } @{ 'cg-skole' = @('code:local_aaa') }
+        $collect = New-ScopeEntry @(@{ id = 'cg-collect'; name = 'collect' })
+        $ldb1 = New-LevelDb @{ 'devA/ws1' = $collect; 'devB/ws2' = $skole } -LastScope 'devA/ws1' -Extra @{ 'ccd-sync-owner' = 'devA'; 'epitaxy-context-usage-logout-at' = '1000' }
+        Invoke-Sync $root $state -LevelDb $ldb1
+        Read-LevelDbText $ldb1 'ccd-sync-pending:ccd/dframe-store' | Should -Be 'devA/ws1'
+        # The user relogged away and back to A before the app pushed: the marker is
+        # gone, A's server row never had skole, and the pull put A back to collect.
+        $switchAfter = [string]([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds())
+        $ldb2 = New-LevelDb @{ 'devA/ws1' = $collect; 'devB/ws2' = (Get-ScopeFromStore $ldb1 'devB/ws2') } -LastScope 'devA/ws1' -Extra @{ 'ccd-sync-owner' = 'devA'; 'epitaxy-context-usage-logout-at' = $switchAfter }
+        Invoke-Sync $root $state -LevelDb $ldb2
+        Get-Heartbeat $state | Should -Match 'groups updated$'
+        @((Get-ScopeFromStore $ldb2 'devA/ws1').groups).id | Sort-Object | Should -Be @('cg-collect', 'cg-skole')
+        @((Get-ScopeFromStore $ldb2 'devB/ws2').groups).id | Sort-Object | Should -Be @('cg-collect', 'cg-skole')
+        Read-LevelDbText $ldb2 'ccd-sync-pending:ccd/dframe-store' | Should -Be 'devA/ws1'
+        @((Get-Content (Join-Path $state 'groups-base.json') -Raw | ConvertFrom-Json).tombstones.PSObject.Properties).Count | Should -Be 0
     }
 
     It 'never deletes on the first merge: two accounts with different groups end up with the union' {
