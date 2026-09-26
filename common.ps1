@@ -9,8 +9,57 @@ $SyncLauncher       = Join-Path $SyncInstallDir 'sync-hidden.vbs'
 $SyncLogFile        = Join-Path $SyncInstallDir 'sync-log.txt'
 $SyncManifestFile   = Join-Path $SyncInstallDir 'sync-fullset.txt'
 $SyncGroupHelperDir = Join-Path $SyncInstallDir 'group-sync'
+# Where the desktop app keeps everything it owns: claude-code-sessions,
+# claude_desktop_config.json and the Electron profile's Local Storage.
+#
+# It is not always %APPDATA%\Claude. The MSIX build turns on write
+# virtualization and does not exempt Roaming, so on a machine where the app
+# never had a real %APPDATA%\Claude to write into, all of it lands under the
+# package's own mirror of Roaming instead and the real path never appears. A
+# machine that ran the unpackaged build first keeps the real path and the
+# mirror stays absent, and a machine that did both has both.
+#
+# So the roots are discovered, never assumed: every candidate that exists is
+# returned, LEAST recently written first. That order is the engine's convention,
+# not a presentation choice: it resolves a tie toward the last root, which is
+# the one a half-migrated machine is migrating INTO, and syncing into the root
+# the app is abandoning repopulates it forever.
+function Get-ClaudeDataRoots([string]$PackagesRoot = (Join-Path $env:LOCALAPPDATA 'Packages')) {
+    $candidates = @(Join-Path $env:APPDATA 'Claude')
+    $candidates += @(
+        Get-ChildItem -Path $PackagesRoot -Directory -Filter 'Claude_*' -ErrorAction SilentlyContinue |
+            ForEach-Object { Join-Path $_.FullName 'LocalCache\Roaming\Claude' }
+    )
+    @($candidates | Where-Object { Test-Path -LiteralPath $_ } |
+        Sort-Object { (Get-Item -LiteralPath $_).LastWriteTimeUtc })
+}
+
+# One path under the app's data root, e.g. 'claude_desktop_config.json'. The app
+# reads and writes exactly one of them, and a write into the stale copy is
+# silently discarded, so this takes the FRESHEST root that actually holds the
+# file: last in the list, hence the reverse walk. With no hit anywhere it
+# returns the real %APPDATA% path, so a caller creating the file creates it
+# where an unpackaged app would look for it.
+function Resolve-ClaudeDataPath([string]$RelativePath, [string]$PackagesRoot = (Join-Path $env:LOCALAPPDATA 'Packages')) {
+    $roots = @(Get-ClaudeDataRoots $PackagesRoot)
+    for ($i = $roots.Count - 1; $i -ge 0; $i--) {
+        $candidate = Join-Path $roots[$i] $RelativePath
+        if (Test-Path -LiteralPath $candidate) { return $candidate }
+    }
+    Join-Path (Join-Path $env:APPDATA 'Claude') $RelativePath
+}
+
+# The third-party/enterprise build keeps its sessions outside the Roaming tree,
+# so it is a root in its own right rather than a path under one.
+function Get-ClaudeSessionRoots([string]$PackagesRoot = (Join-Path $env:LOCALAPPDATA 'Packages')) {
+    @(
+        @(Get-ClaudeDataRoots $PackagesRoot | ForEach-Object { Join-Path $_ 'claude-code-sessions' }) +
+        @(Join-Path $env:LOCALAPPDATA 'Claude-3p\claude-code-sessions')
+    ) | Where-Object { Test-Path -LiteralPath $_ }
+}
+
 # The desktop app's Electron profile: sidebar groups live in its Local Storage.
-$ClaudeLocalStorageDir = Join-Path $env:APPDATA 'Claude\Local Storage\leveldb'
+$ClaudeLocalStorageDir = Resolve-ClaudeDataPath 'Local Storage\leveldb'
 
 # Strings that identify a scheduled task as ours (current or legacy versions).
 # Used before any unregister so install/uninstall can never clobber a foreign task.

@@ -41,10 +41,7 @@ if (-not $srcVer) { throw 'Could not read $ToolVersion from the source script; r
 
 # ── Backup gate: first install AND every version change, BEFORE anything changes
 $existingBackup = Get-ChildItem -Path $SyncInstallDir -Filter 'backup-*.zip' -ErrorAction SilentlyContinue
-$backupRoots = @(
-    (Join-Path $env:APPDATA 'Claude\claude-code-sessions'),
-    (Join-Path $env:LOCALAPPDATA 'Claude-3p\claude-code-sessions')
-) | Where-Object { Test-Path $_ }
+$backupRoots = Get-ClaudeSessionRoots
 $needBackup = (-not $existingBackup) -or ($installedVer -ne $srcVer)
 if ($needBackup -and @($backupRoots).Count -gt 0) {
     $zip = Join-Path $SyncInstallDir "backup-$(Get-Date -Format 'yyyyMMdd-HHmmss').zip"

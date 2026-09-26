@@ -44,21 +44,18 @@ param(
     [string]$PackagesRootOverride # unsupported test hook: MSIX packages root for the shadow probe
 )
 $ErrorActionPreference = 'Continue'
-$ToolVersion = '0.7.0'
+$ToolVersion = '0.7.1'
 $ManifestMaxAgeDays = 7
 $StashRetentionDays = 30
 . "$PSScriptRoot\common.ps1"
 
-$roots = if ($RootsOverride) { @($RootsOverride | Where-Object { Test-Path $_ }) } else {
-    @(
-        (Join-Path $env:APPDATA 'Claude\claude-code-sessions'),
-        (Join-Path $env:LOCALAPPDATA 'Claude-3p\claude-code-sessions')
-    ) | Where-Object { Test-Path $_ }
-}
-$configPath = if ($ConfigPathOverride) { $ConfigPathOverride } else { Join-Path $env:APPDATA 'Claude\claude_desktop_config.json' }
-$leveldbPath = if ($LevelDbPathOverride) { $LevelDbPathOverride } else { $ClaudeLocalStorageDir }
-$helperDir = if ($GroupHelperOverride) { $GroupHelperOverride } else { Join-Path $PSScriptRoot 'group-sync' }
 $packagesRoot = if ($PackagesRootOverride) { $PackagesRootOverride } else { Join-Path $env:LOCALAPPDATA 'Packages' }
+$roots = if ($RootsOverride) { @($RootsOverride | Where-Object { Test-Path $_ }) } else {
+    Get-ClaudeSessionRoots $packagesRoot
+}
+$configPath = if ($ConfigPathOverride) { $ConfigPathOverride } else { Resolve-ClaudeDataPath 'claude_desktop_config.json' $packagesRoot }
+$leveldbPath = if ($LevelDbPathOverride) { $LevelDbPathOverride } else { Resolve-ClaudeDataPath 'Local Storage\leveldb' $packagesRoot }
+$helperDir = if ($GroupHelperOverride) { $GroupHelperOverride } else { Join-Path $PSScriptRoot 'group-sync' }
 # State always lives in the per-user install dir, never next to whichever copy of
 # the script happened to run: a git-clone test run must not write logs, manifests
 # or config backups (which can carry MCP secrets) into a tree someone might push.
@@ -107,6 +104,14 @@ function Get-NewestActivity($wsPath) {
     $n = Get-ChildItem -Path $wsPath -Filter 'local_*.json' -File -ErrorAction SilentlyContinue |
         Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 1
     if ($n) { $n.LastWriteTimeUtc } else { [datetime]::MinValue }
+}
+
+# No root at all used to report itself as "0 root(s)" and nothing else, which
+# reads as "no chats yet" when it actually means the app keeps its data
+# somewhere this build did not look. Naming the places is the difference
+# between a user filing it and a user shrugging at it.
+if (@($roots).Count -eq 0) {
+    Log "warning: no session root found; looked under $(Join-Path $env:APPDATA 'Claude'), $packagesRoot\Claude_*\LocalCache\Roaming\Claude and $(Join-Path $env:LOCALAPPDATA 'Claude-3p')"
 }
 
 # ── Discovery: one target workspace per device-id, one root at a time ────────

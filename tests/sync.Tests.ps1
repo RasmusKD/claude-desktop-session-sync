@@ -534,3 +534,94 @@ Describe 'MSIX shadow refusal' {
         @(Get-ChildItem $state -Filter '.virt-probe-*' -Force).Count | Should -Be 0
     }
 }
+
+Describe 'data-root discovery (packaged and unpackaged installs)' {
+    BeforeAll {
+        . (Join-Path $script:repo 'common.ps1')
+
+        # $env:APPDATA is what Get-ClaudeDataRoots reads for the unpackaged
+        # candidate, so a test that wants "no real root" has to move it, not
+        # just point the packages root elsewhere.
+        function Use-FakeAppData([scriptblock]$Body) {
+            $prev = $env:APPDATA
+            $env:APPDATA = Join-Path $TestDrive ("appdata-" + [guid]::NewGuid().ToString('N').Substring(0, 8))
+            New-Item -ItemType Directory -Force -Path $env:APPDATA | Out-Null
+            try { & $Body } finally { $env:APPDATA = $prev }
+        }
+
+        function New-PackagedRoot($Packages, $Package = 'Claude_pzs8sxrjxfjjc') {
+            $d = Join-Path $Packages "$Package\LocalCache\Roaming\Claude"
+            New-Item -ItemType Directory -Force -Path $d | Out-Null
+            return $d
+        }
+    }
+
+    It 'finds the sessions of an MSIX install that virtualizes Roaming' {
+        Use-FakeAppData {
+            $packages = Join-Path $TestDrive ("pk-" + [guid]::NewGuid().ToString('N').Substring(0, 8))
+            $packaged = New-PackagedRoot $packages
+            New-Item -ItemType Directory -Force -Path (Join-Path $packaged 'claude-code-sessions\devA\ws1') | Out-Null
+
+            $roots = @(Get-ClaudeSessionRoots $packages)
+
+            $roots.Count | Should -Be 1
+            $roots[0] | Should -Be (Join-Path $packaged 'claude-code-sessions')
+        }
+    }
+
+    It 'ignores a package that is not the app, and one with no Roaming mirror' {
+        Use-FakeAppData {
+            $packages = Join-Path $TestDrive ("pk-" + [guid]::NewGuid().ToString('N').Substring(0, 8))
+            New-Item -ItemType Directory -Force -Path (Join-Path $packages 'SomeApp_abc123\LocalCache\Roaming\Claude\claude-code-sessions') | Out-Null
+            New-Item -ItemType Directory -Force -Path (Join-Path $packages 'Claude_pzs8sxrjxfjjc\LocalCache\Local') | Out-Null
+
+            @(Get-ClaudeSessionRoots $packages).Count | Should -Be 0
+        }
+    }
+
+    It 'keeps both roots on a half-migrated machine, migration target last' {
+        Use-FakeAppData {
+            $packages = Join-Path $TestDrive ("pk-" + [guid]::NewGuid().ToString('N').Substring(0, 8))
+            $real = Join-Path $env:APPDATA 'Claude'
+            New-Item -ItemType Directory -Force -Path (Join-Path $real 'claude-code-sessions') | Out-Null
+            $packaged = New-PackagedRoot $packages
+            New-Item -ItemType Directory -Force -Path (Join-Path $packaged 'claude-code-sessions') | Out-Null
+            # The engine resolves a tie toward the LAST root, so the freshest
+            # (the one the app moved to) has to sort last, not first.
+            [System.IO.Directory]::SetLastWriteTimeUtc($real, (Get-Date).ToUniversalTime().AddDays(-2))
+            [System.IO.Directory]::SetLastWriteTimeUtc($packaged, (Get-Date).ToUniversalTime())
+
+            $roots = @(Get-ClaudeSessionRoots $packages)
+
+            $roots.Count | Should -Be 2
+            $roots[0] | Should -Be (Join-Path $real 'claude-code-sessions')
+            $roots[1] | Should -Be (Join-Path $packaged 'claude-code-sessions')
+        }
+    }
+
+    It 'resolves a single-valued path to the freshest root that holds it' {
+        Use-FakeAppData {
+            $packages = Join-Path $TestDrive ("pk-" + [guid]::NewGuid().ToString('N').Substring(0, 8))
+            $real = Join-Path $env:APPDATA 'Claude'
+            New-Item -ItemType Directory -Force -Path $real | Out-Null
+            Set-Content -Path (Join-Path $real 'claude_desktop_config.json') -Value '{}' -NoNewline
+            $packaged = New-PackagedRoot $packages
+            Set-Content -Path (Join-Path $packaged 'claude_desktop_config.json') -Value '{}' -NoNewline
+            [System.IO.Directory]::SetLastWriteTimeUtc($real, (Get-Date).ToUniversalTime().AddDays(-2))
+            [System.IO.Directory]::SetLastWriteTimeUtc($packaged, (Get-Date).ToUniversalTime())
+
+            Resolve-ClaudeDataPath 'claude_desktop_config.json' $packages |
+                Should -Be (Join-Path $packaged 'claude_desktop_config.json')
+        }
+    }
+
+    It 'falls back to the real %APPDATA% path when nothing holds the file' {
+        Use-FakeAppData {
+            $packages = Join-Path $TestDrive ("pk-" + [guid]::NewGuid().ToString('N').Substring(0, 8))
+            New-Item -ItemType Directory -Force -Path $packages | Out-Null
+
+            Resolve-ClaudeDataPath 'claude_desktop_config.json' $packages |
+                Should -Be (Join-Path (Join-Path $env:APPDATA 'Claude') 'claude_desktop_config.json')
+        }
+    }
+}
