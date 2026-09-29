@@ -83,6 +83,7 @@ if ($needBackup -and @($backupRoots).Count -gt 0) {
 # ── Payload goes live only after the backup gate ─────────────────────────────
 Copy-Item $srcScript -Destination $SyncScriptInstalled -Force
 Copy-Item $srcCommon -Destination $SyncCommonInstalled -Force
+Copy-Item (Join-Path $PSScriptRoot 'task-sync.ps1') -Destination (Join-Path $SyncInstallDir 'task-sync.ps1') -Force
 # State files of the v0.5 config splice; the merge keeps its own base now.
 foreach ($old in @('cfg-consensus.txt', 'cfg-error-count.txt', 'CONFIG-MIRROR-BROKEN.txt')) {
     Remove-Item -LiteralPath (Join-Path $SyncInstallDir $old) -Force -ErrorAction SilentlyContinue

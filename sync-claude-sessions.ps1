@@ -25,6 +25,11 @@
 #    us otherwise, reported as "deferred", never as success), backup-first, and
 #    then mirrors the result into claude_desktop_config.json the way the app
 #    itself does. Without Node.js the group stage is off and everything else runs.
+#  - scheduled tasks (claude-code-sessions\<account>\<org>\scheduled-tasks.json)
+#    are merged three-way by task-sync.ps1 against tasks-base.json: union by id,
+#    deletions only via the base, run state monotonic, and a one-time task near
+#    its fireAt enabled in exactly one account, so no task fires twice. The
+#    account the app runs on is never written while it runs.
 #  - a process whose view of %LOCALAPPDATA% is an MSIX shadow (one launched from
 #    inside the desktop app) refuses to run: its state directory would be a
 #    copy nobody else reads, and its log would look dead from everywhere else.
@@ -41,13 +46,17 @@ param(
     [string]$StateDirOverride,    # unsupported test hook: keep state out of the repo
     [string]$LevelDbPathOverride, # unsupported test hook: fixture Local Storage (skips the app-running pre-check)
     [string]$GroupHelperOverride, # unsupported test hook: helper directory
-    [string]$PackagesRootOverride # unsupported test hook: MSIX packages root for the shadow probe
+    [string]$PackagesRootOverride, # unsupported test hook: MSIX packages root for the shadow probe
+    [string]$AppConfigOverride,   # unsupported test hook: the app's config.json (lastKnownAccountUuid)
+    [ValidateSet('', 'running', 'closed')]
+    [string]$AppStateOverride = '' # unsupported test hook: pretend the app is running or closed
 )
 $ErrorActionPreference = 'Continue'
-$ToolVersion = '0.7.1'
+$ToolVersion = '0.8.0'
 $ManifestMaxAgeDays = 7
 $StashRetentionDays = 30
 . "$PSScriptRoot\common.ps1"
+. "$PSScriptRoot\task-sync.ps1"
 
 $packagesRoot = if ($PackagesRootOverride) { $PackagesRootOverride } else { Join-Path $env:LOCALAPPDATA 'Packages' }
 $roots = if ($RootsOverride) { @($RootsOverride | Where-Object { Test-Path $_ }) } else {
@@ -55,6 +64,8 @@ $roots = if ($RootsOverride) { @($RootsOverride | Where-Object { Test-Path $_ })
 }
 $configPath = if ($ConfigPathOverride) { $ConfigPathOverride } else { Resolve-ClaudeDataPath 'claude_desktop_config.json' $packagesRoot }
 $leveldbPath = if ($LevelDbPathOverride) { $LevelDbPathOverride } else { Resolve-ClaudeDataPath 'Local Storage\leveldb' $packagesRoot }
+# A fixture tree never reads the real app's account: without the hook it is unknown.
+$appConfigPath = if ($AppConfigOverride) { $AppConfigOverride } elseif ($RootsOverride) { '' } else { Resolve-ClaudeDataPath 'config.json' $packagesRoot }
 $helperDir = if ($GroupHelperOverride) { $GroupHelperOverride } else { Join-Path $PSScriptRoot 'group-sync' }
 # State always lives in the per-user install dir, never next to whichever copy of
 # the script happened to run: a git-clone test run must not write logs, manifests
@@ -73,6 +84,7 @@ $lockStuckF  = Join-Path $stateDir 'SYNC-LOCK-STUCK.txt'
 $grpErrCntF  = Join-Path $stateDir 'groups-error-count.txt'
 $lockCntF    = Join-Path $stateDir 'lock-skip-count.txt'
 $groupsBaseF = Join-Path $stateDir 'groups-base.json'
+$tasksBaseF  = Join-Path $stateDir 'tasks-base.json'
 
 function Log($msg) {
     $line = "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')  $msg"
@@ -231,6 +243,11 @@ if ($Status) {
     } else {
         Write-Host "group sync:       off ($($hs.reason))" -ForegroundColor Yellow
     }
+    $taskApp = if ($AppStateOverride) { $AppStateOverride -eq 'running' } else { Test-ClaudeAppRunning }
+    $taskAcct = Get-LastKnownAccount $appConfigPath
+    $taskNote = if ($taskApp) { "the app is running on $(if ($taskAcct) { $taskAcct } else { 'an unknown account' }); that account's file waits for it to close or switch" } else { 'app closed' }
+    $taskBase = if (Test-Path $tasksBaseF) { "base $(([System.IO.File]::GetLastWriteTime($tasksBaseF)).ToString('yyyy-MM-dd HH:mm'))" } else { 'no base yet' }
+    Write-Host "task sync:        on ($taskNote; $taskBase)"
     Write-Host "log:              $logF"
     foreach ($marker in @($brokenF, $lockStuckF)) {
         if (Test-Path $marker) { Write-Host "ATTENTION: $(Split-Path $marker -Leaf) exists; see $marker" -ForegroundColor Red }
@@ -316,7 +333,7 @@ if ($Restore) {
     exit 0
 }
 
-$copies = 0; $skipped = 0; $contestedCount = 0; $deleted = 0; $groupsState = 'skipped'
+$copies = 0; $skipped = 0; $contestedCount = 0; $deleted = 0; $groupsState = 'skipped'; $tasksState = 'skipped'
 $failedDeletes = @{}
 
 if (@($activeTargets).Count -ge 2 -and $sourceSet.Count -ge 1) {
@@ -452,6 +469,18 @@ if (@($activeTargets).Count -ge 2 -and $sourceSet.Count -ge 1) {
         }
     }
 
+    # ── Scheduled tasks: three-way merge per scope file ──────────────────────
+    # After the chat copies on purpose: a task's notifySessionId is kept in a
+    # scope only when that chat exists there, which the copy stage just ensured.
+    $taskAppRunning = if ($AppStateOverride) { $AppStateOverride -eq 'running' } elseif ($RootsOverride) { $false } else { Test-ClaudeAppRunning }
+    try {
+        $tasksState = Invoke-ScheduledTaskSync -Targets @($activeTargets) -StateDir $stateDir -AppRunning $taskAppRunning `
+            -KnownAccount ([string](Get-LastKnownAccount $appConfigPath)) -DryRun ([bool]$WhatIfPreference) -Log { param($m) Log $m }
+    } catch {
+        $tasksState = 'error'
+        Log "warning: task sync failed: $($_.Exception.Message)"
+    }
+
     # ── Sidebar groups: three-way merge in Local Storage, app closed only ────
     # The helper owns the merge, the backups and the config mirror; this side
     # decides whether it may run at all and turns its answer into state.
@@ -513,7 +542,7 @@ if (@($activeTargets).Count -ge 2 -and $sourceSet.Count -ge 1) {
     }
 }
 
-Log "v$ToolVersion run: $(@($roots).Count) root(s), $(@($activeTargets).Count) workspace(s) ($($sourceSet.Count) with chats, $frozen frozen), $contestedCount contested, $copies copied, $skipped skipped, $deleted deleted, groups $groupsState"
+Log "v$ToolVersion run: $(@($roots).Count) root(s), $(@($activeTargets).Count) workspace(s) ($($sourceSet.Count) with chats, $frozen frozen), $contestedCount contested, $copies copied, $skipped skipped, $deleted deleted, groups $groupsState, tasks $tasksState"
 $tail = Get-Content $logF -Tail 1000 -ErrorAction SilentlyContinue
 if ($tail) {
     $tmpLog = "$logF.cs-tmp-$PID"
