@@ -3,8 +3,10 @@
 # false-positives), device guards, deletion propagation (partial-failure
 # non-resurrection, freeze durability, stash retention and quality), sidebar
 # groups (three-way merge in a fixture Local Storage LevelDB, the app-running
-# refusal, the config mirror's byte fidelity, BOM and decoy anchors), the MSIX
-# shadow refusal, and -WhatIf inertness.
+# refusal, the config mirror's byte fidelity, BOM and decoy anchors), scheduled
+# tasks (union, run-state propagation, deletions, holds, the first-run rule, the
+# running-app and locked-file deferrals), the MSIX shadow refusal, and -WhatIf
+# inertness.
 
 BeforeAll {
     $script:repo    = Split-Path $PSScriptRoot -Parent
@@ -45,12 +47,14 @@ BeforeAll {
     # unless a test hands it fixtures: a fixture tree must never pair with the
     # real database or the real config (the engine refuses that pairing too).
     function Invoke-Sync {
-        param($Root, $StateDir, [switch]$WhatIf, [switch]$Loud, [string]$ConfigPath = '', [string]$LevelDb = '', [string]$HelperDir = '', [string]$PackagesRoot = '')
+        param($Root, $StateDir, [switch]$WhatIf, [switch]$Loud, [string]$ConfigPath = '', [string]$LevelDb = '', [string]$HelperDir = '', [string]$PackagesRoot = '', [string]$AppState = '', [string]$AppConfig = '')
         $p = @{ RootsOverride = $Root; StateDirOverride = $StateDir; Quiet = (-not $Loud) }
         $p.LevelDbPathOverride = if ($LevelDb) { $LevelDb } else { Join-Path $TestDrive 'no-leveldb-here' }
         $p.ConfigPathOverride  = if ($ConfigPath) { $ConfigPath } else { Join-Path $TestDrive 'no-config-here.json' }
         if ($HelperDir)    { $p.GroupHelperOverride = $HelperDir }
         if ($PackagesRoot) { $p.PackagesRootOverride = $PackagesRoot }
+        if ($AppState)     { $p.AppStateOverride = $AppState }
+        if ($AppConfig)    { $p.AppConfigOverride = $AppConfig }
         if ($WhatIf) { & $script:engine @p -WhatIf }
         else         { & $script:engine @p -Confirm:$false }
     }
@@ -133,7 +137,7 @@ Describe 'cross-account propagation' {
         $root = New-Fixture @('devA/ws1', 'devB/ws2'); $state = New-StateDir
         New-Chat (Join-Path $root 'devA/ws1') 'aaa' | Out-Null
         Invoke-Sync $root $state
-        Get-Heartbeat $state | Should -Match 'groups off$'
+        Get-Heartbeat $state | Should -Match 'groups off, tasks '
     }
 }
 
@@ -279,7 +283,7 @@ Describe 'sidebar groups (Local Storage merge)' -Skip:$script:noNode {
         } -LastScope 'devB/ws2'
         $cfg = New-GroupConfig
         Invoke-Sync $root $state -LevelDb $ldb -ConfigPath $cfg
-        Get-Heartbeat $state | Should -Match 'groups updated$'
+        Get-Heartbeat $state | Should -Match 'groups updated, tasks '
         foreach ($scope in 'devA/ws1', 'devB/ws2') {
             $s = Get-ScopeFromStore $ldb $scope
             @($s.groups).id | Should -Be @('cg-1')
@@ -310,14 +314,14 @@ Describe 'sidebar groups (Local Storage merge)' -Skip:$script:noNode {
         $entry = New-ScopeEntry $both @{ 'code:local_aaa' = 'cg-1'; 'code:local_bbb' = 'cg-2' } @{ 'cg-1' = @('code:local_aaa'); 'cg-2' = @('code:local_bbb') }
         $ldb1 = New-LevelDb @{ 'devA/ws1' = $entry; 'devB/ws2' = $entry }
         Invoke-Sync $root $state -LevelDb $ldb1
-        Get-Heartbeat $state | Should -Match 'groups unchanged$'
+        Get-Heartbeat $state | Should -Match 'groups unchanged, tasks '
         Join-Path $state 'groups-base.json' | Should -Exist
         # A deletes cg-1 (and its assignment); B renames cg-2.
         $a = New-ScopeEntry @(@{ id = 'cg-2'; name = 'two' }) @{ 'code:local_bbb' = 'cg-2' } @{ 'cg-2' = @('code:local_bbb') }
         $b = New-ScopeEntry @(@{ id = 'cg-1'; name = 'one' }, @{ id = 'cg-2'; name = 'Two!' }) @{ 'code:local_aaa' = 'cg-1'; 'code:local_bbb' = 'cg-2' } @{ 'cg-1' = @('code:local_aaa'); 'cg-2' = @('code:local_bbb') }
         $ldb2 = New-LevelDb @{ 'devA/ws1' = $a; 'devB/ws2' = $b } -LastScope 'devB/ws2'
         Invoke-Sync $root $state -LevelDb $ldb2
-        Get-Heartbeat $state | Should -Match 'groups updated$'
+        Get-Heartbeat $state | Should -Match 'groups updated, tasks '
         foreach ($scope in 'devA/ws1', 'devB/ws2') {
             $s = Get-ScopeFromStore $ldb2 $scope
             @($s.groups).id | Should -Be @('cg-2')
@@ -337,7 +341,7 @@ Describe 'sidebar groups (Local Storage merge)' -Skip:$script:noNode {
         # 1. The app last ran on A, which created skole; B's row on the server holds collect only.
         $ldb1 = New-LevelDb @{ 'devA/ws1' = $skole; 'devB/ws2' = $collect } -LastScope 'devA/ws1' -Extra @{ 'ccd-sync-owner' = 'devA'; 'epitaxy-context-usage-logout-at' = $switchBefore }
         Invoke-Sync $root $state -LevelDb $ldb1
-        Get-Heartbeat $state | Should -Match 'groups updated$'
+        Get-Heartbeat $state | Should -Match 'groups updated, tasks '
         foreach ($scope in 'devA/ws1', 'devB/ws2') { @((Get-ScopeFromStore $ldb1 $scope).groups).id | Sort-Object | Should -Be @('cg-collect', 'cg-skole') }
         Read-LevelDbText $ldb1 'ccd-sync-pending:ccd/dframe-store' | Should -Be 'devA/ws1'   # A pushes its local state at the next start
         $merged = Get-ScopeFromStore $ldb1 'devA/ws1'
@@ -346,7 +350,7 @@ Describe 'sidebar groups (Local Storage merge)' -Skip:$script:noNode {
         $switchAfter = [string]([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds())
         $ldb2 = New-LevelDb @{ 'devA/ws1' = $merged; 'devB/ws2' = $collect } -LastScope 'devB/ws2' -Extra @{ 'ccd-sync-owner' = 'devB'; 'epitaxy-context-usage-logout-at' = $switchAfter }
         Invoke-Sync $root $state -LevelDb $ldb2
-        Get-Heartbeat $state | Should -Match 'groups updated$'
+        Get-Heartbeat $state | Should -Match 'groups updated, tasks '
         (Get-Content (Join-Path $state 'sync-log.txt') -Tail 2)[0] | Should -Match '\+0 -0 ~0 group\(s\), 0 withheld'
         $b = Get-ScopeFromStore $ldb2 'devB/ws2'
         @($b.groups).id | Sort-Object | Should -Be @('cg-collect', 'cg-skole')
@@ -362,7 +366,7 @@ Describe 'sidebar groups (Local Storage merge)' -Skip:$script:noNode {
         #    user deleted skole on B. That deletion is real and reaches A.
         $ldb3 = New-LevelDb @{ 'devA/ws1' = $merged; 'devB/ws2' = $collect } -LastScope 'devB/ws2' -Extra @{ 'ccd-sync-owner' = 'devB'; 'epitaxy-context-usage-logout-at' = $switchAfter }
         Invoke-Sync $root $state -LevelDb $ldb3
-        Get-Heartbeat $state | Should -Match 'groups updated$'
+        Get-Heartbeat $state | Should -Match 'groups updated, tasks '
         @((Get-ScopeFromStore $ldb3 'devA/ws1').groups).id | Should -Be @('cg-collect')
         (Get-ScopeFromStore $ldb3 'devA/ws1').assignments.PSObject.Properties.Name | Should -Not -Contain 'code:local_aaa'
         Read-LevelDbText $ldb3 'ccd-sync-pending:ccd/dframe-store' | Should -BeNullOrEmpty       # B's server row already lacks it
@@ -388,7 +392,7 @@ Describe 'sidebar groups (Local Storage merge)' -Skip:$script:noNode {
         $switchAfter = [string]([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds())
         $ldb2 = New-LevelDb @{ 'devA/ws1' = $collect; 'devB/ws2' = (Get-ScopeFromStore $ldb1 'devB/ws2') } -LastScope 'devA/ws1' -Extra @{ 'ccd-sync-owner' = 'devA'; 'epitaxy-context-usage-logout-at' = $switchAfter }
         Invoke-Sync $root $state -LevelDb $ldb2
-        Get-Heartbeat $state | Should -Match 'groups updated$'
+        Get-Heartbeat $state | Should -Match 'groups updated, tasks '
         @((Get-ScopeFromStore $ldb2 'devA/ws1').groups).id | Sort-Object | Should -Be @('cg-collect', 'cg-skole')
         @((Get-ScopeFromStore $ldb2 'devB/ws2').groups).id | Sort-Object | Should -Be @('cg-collect', 'cg-skole')
         Read-LevelDbText $ldb2 'ccd-sync-pending:ccd/dframe-store' | Should -Be 'devA/ws1'
@@ -438,7 +442,7 @@ Describe 'sidebar groups (Local Storage merge)' -Skip:$script:noNode {
             $before = @(Get-ChildItem $ldb -File | ForEach-Object { "$($_.Name):$($_.Length)" }) -join ';'
             Invoke-Sync $root $state -LevelDb $ldb
         } finally { Stop-Process -Id $holder.Id -Force -ErrorAction SilentlyContinue; $holder.WaitForExit() }
-        Get-Heartbeat $state | Should -Match 'groups deferred$'
+        Get-Heartbeat $state | Should -Match 'groups deferred, tasks '
         Join-Path $state 'groups-base.json' | Should -Not -Exist
         @(Get-ChildItem $state -Filter 'leveldb-backup-*' -Directory).Count | Should -Be 0
         (@(Get-ChildItem $ldb -File | ForEach-Object { "$($_.Name):$($_.Length)" }) -join ';') | Should -Be $before
@@ -487,7 +491,7 @@ Describe 'sidebar groups (Local Storage merge)' -Skip:$script:noNode {
         $ldb = New-LevelDb @{ 'devA/ws1' = $entry; 'devB/ws2' = $entry }
         $cfg = New-GroupConfig                                  # mirror is behind: devB/ws2 missing, devA/ws1 empty
         Invoke-Sync $root $state -LevelDb $ldb -ConfigPath $cfg
-        Get-Heartbeat $state | Should -Match 'groups mirrored$'
+        Get-Heartbeat $state | Should -Match 'groups mirrored, tasks '
         $parsed = Get-Content $cfg -Raw | ConvertFrom-Json
         @($parsed.preferences.epitaxyPrefs.'dframe-group-scopes'.'devB/ws2'.groups)[0].id | Should -Be 'cg-1'
     }
@@ -497,7 +501,7 @@ Describe 'sidebar groups (Local Storage merge)' -Skip:$script:noNode {
         New-Chat (Join-Path $root 'devA/ws1') 'aaa' | Out-Null
         $ldb = New-LevelDb @{ 'devA/ws1' = New-ScopeEntry @(@{ id = 'cg-1'; name = 'one' }); 'devB/ws2' = New-ScopeEntry @() }
         Invoke-Sync $root $state -LevelDb $ldb -HelperDir (Join-Path $TestDrive 'no-helper')
-        Get-Heartbeat $state | Should -Match 'groups off$'
+        Get-Heartbeat $state | Should -Match 'groups off, tasks '
         Join-Path $root 'devB/ws2/local_aaa.json' | Should -Exist
         @((Get-ScopeFromStore $ldb 'devB/ws2').groups).Count | Should -Be 0
     }
@@ -623,5 +627,320 @@ Describe 'data-root discovery (packaged and unpackaged installs)' {
             Resolve-ClaudeDataPath 'claude_desktop_config.json' $packages |
                 Should -Be (Join-Path (Join-Path $env:APPDATA 'Claude') 'claude_desktop_config.json')
         }
+    }
+}
+
+Describe 'scheduled tasks (three-way merge of scheduled-tasks.json)' {
+    BeforeAll {
+        . (Join-Path $script:repo 'task-sync.ps1')
+        $script:nowMs = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+        $script:day = 24L * 3600 * 1000
+
+        function Get-Iso([long]$Ms) { [DateTimeOffset]::FromUnixTimeMilliseconds($Ms).UtcDateTime.ToString('yyyy-MM-ddTHH:mm:ss.fffZ', [System.Globalization.CultureInfo]::InvariantCulture) }
+
+        # Shape observed in Claude desktop 1.46388.x.
+        function New-Task([string]$Id, [hashtable]$Props = @{}) {
+            $t = New-OrdinalDict
+            $t['id'] = $Id
+            $t['displayName'] = "task $Id"
+            if (-not $Props.ContainsKey('cronExpression')) { $t['fireAt'] = $script:nowMs + 3 * $script:day }
+            $t['enabled'] = $true
+            $t['filePath'] = "C:\Users\x\.claude\scheduled-tasks\$Id\SKILL.md"
+            $t['createdAt'] = $script:nowMs - $script:day
+            $t['cwd'] = 'C:\work'
+            foreach ($k in $Props.Keys) { if ($null -eq $Props[$k]) { $t.Remove($k) } else { $t[$k] = $Props[$k] } }
+            return ,$t
+        }
+
+        function Set-Tasks([string]$Ws, [object[]]$Tasks, [hashtable]$Extra = @{}) {
+            $doc = New-OrdinalDict
+            $list = New-Object System.Collections.ArrayList
+            foreach ($t in $Tasks) { [void]$list.Add($t) }
+            $doc['scheduledTasks'] = $list
+            $doc['recordedSkips'] = New-OrdinalDict
+            $doc['sundayAliasBoundaryStamped'] = $true
+            foreach ($k in $Extra.Keys) { if ($null -eq $Extra[$k]) { $doc.Remove($k) } else { $doc[$k] = $Extra[$k] } }
+            [System.IO.File]::WriteAllText((Join-Path $Ws 'scheduled-tasks.json'), (ConvertTo-TaskJson $doc), (New-Object System.Text.UTF8Encoding($false)))
+        }
+        function Get-TaskDoc([string]$Ws) { ConvertFrom-TaskJson ([System.IO.File]::ReadAllText((Join-Path $Ws 'scheduled-tasks.json'))) }
+        function Get-Tasks([string]$Ws) { Get-TaskMap (Get-TaskDoc $Ws) }
+        function Get-TaskText([string]$Ws) { [System.IO.File]::ReadAllText((Join-Path $Ws 'scheduled-tasks.json')) }
+        function Get-TaskIds([string]$Ws) { $k = @((Get-Tasks $Ws).Keys); [Array]::Sort($k, [System.StringComparer]::Ordinal); $k }
+
+        function New-AppConfig([string]$Account) {
+            $p = Join-Path $TestDrive ("appcfg-" + [guid]::NewGuid().ToString('N').Substring(0, 8) + '.json')
+            [System.IO.File]::WriteAllText($p, "{`n`t`"lastKnownAccountUuid`": `"$Account`"`n}")
+            return $p
+        }
+
+        # Two accounts, one chat so the chat stage (and with it the task stage) runs.
+        function New-TaskFixture([string[]]$Layout = @('devA/ws1', 'devB/ws2')) {
+            $root = New-Fixture $Layout
+            New-Chat (Join-Path $root $Layout[0]) 'c1' | Out-Null
+            return $root
+        }
+    }
+
+    It 'unions tasks by id across accounts, and a second run is quiet' {
+        $root = New-TaskFixture; $state = New-StateDir
+        $a = Join-Path $root 'devA/ws1'; $b = Join-Path $root 'devB/ws2'
+        Set-Tasks $a @((New-Task 't1'))
+        Set-Tasks $b @((New-Task 't2' @{ cronExpression = '0 9 * * 1'; fireAt = $null }))
+        Invoke-Sync $root $state
+        Get-TaskIds $a | Should -Be @('t1', 't2')
+        Get-TaskIds $b | Should -Be @('t1', 't2')
+        (Get-Tasks $a)['t2']['cronExpression'] | Should -Be '0 9 * * 1'
+        (Get-Tasks $a)['t2'].Contains('fireAt') | Should -Be $false
+        Get-Heartbeat $state | Should -Match 'tasks updated$'
+        @(Get-ChildItem $state -Filter 'tasks-backup-*' -Directory).Count | Should -Be 1
+        Invoke-Sync $root $state
+        Get-Heartbeat $state | Should -Match 'tasks unchanged$'
+    }
+
+    It 'propagates a one-time run to every copy, so no other account can fire it again' {
+        $root = New-TaskFixture; $state = New-StateDir
+        $a = Join-Path $root 'devA/ws1'; $b = Join-Path $root 'devB/ws2'
+        $fire = $script:nowMs + 3 * $script:day
+        Set-Tasks $a @((New-Task 't1' @{ fireAt = $fire }))
+        Set-Tasks $b @((New-Task 't1' @{ fireAt = $fire }))
+        Invoke-Sync $root $state                                   # base
+        $ran = Get-Iso ($script:nowMs)
+        Set-Tasks $a @((New-Task 't1' @{ fireAt = $fire; enabled = $false; lastRunAt = $ran; lastScheduledFor = (Get-Iso $fire) }))
+        Invoke-Sync $root $state
+        $t = (Get-Tasks $b)['t1']
+        $t['enabled'] | Should -Be $false
+        $t['lastRunAt'] | Should -Be $ran
+        $t['lastScheduledFor'] | Should -Be (Get-Iso $fire)
+    }
+
+    It 'lets a recorded run win over an enabled copy even before any base exists' {
+        $root = New-TaskFixture; $state = New-StateDir
+        $a = Join-Path $root 'devA/ws1'; $b = Join-Path $root 'devB/ws2'
+        $fire = $script:nowMs - 3600000
+        $ran = Get-Iso ($fire + 60000)
+        Set-Tasks $a @((New-Task 't1' @{ fireAt = $fire; enabled = $false; lastRunAt = $ran }))
+        Set-Tasks $b @((New-Task 't1' @{ fireAt = $fire; enabled = $true; createdAt = $script:nowMs - 60000 }))
+        Invoke-Sync $root $state -AppConfig (New-AppConfig 'devB')
+        foreach ($ws in $a, $b) {
+            (Get-Tasks $ws)['t1']['enabled'] | Should -Be $false
+            (Get-Tasks $ws)['t1']['lastRunAt'] | Should -Be $ran
+        }
+    }
+
+    It 'deletes a task everywhere once the base shows it synced, and does not let a stale copy back' {
+        $root = New-TaskFixture; $state = New-StateDir
+        $a = Join-Path $root 'devA/ws1'; $b = Join-Path $root 'devB/ws2'
+        $orig = New-Task 't1'
+        Set-Tasks $a @($orig, (New-Task 'keep'))
+        Set-Tasks $b @()
+        Invoke-Sync $root $state
+        (Get-Tasks $b).Contains('t1') | Should -Be $true
+        Set-Tasks $a @((New-Task 'keep'))                          # deleted in A
+        Invoke-Sync $root $state
+        (Get-Tasks $b).Contains('t1') | Should -Be $false
+        (Get-Tasks $b).Contains('keep') | Should -Be $true
+        # A stale copy (same createdAt) reappearing is removed again ...
+        Set-Tasks $b @($orig, (New-Task 'keep'))
+        Invoke-Sync $root $state
+        (Get-Tasks $b).Contains('t1') | Should -Be $false
+        # ... but the id recreated later is a new task and propagates.
+        Set-Tasks $a @((New-Task 'keep'), (New-Task 't1' @{ createdAt = $script:nowMs }))
+        Invoke-Sync $root $state
+        (Get-Tasks $b).Contains('t1') | Should -Be $true
+    }
+
+    It 'never deletes without a base: a task missing from one account is added there' {
+        $root = New-TaskFixture; $state = New-StateDir
+        $a = Join-Path $root 'devA/ws1'; $b = Join-Path $root 'devB/ws2'
+        Set-Tasks $a @((New-Task 't1'))
+        Set-Tasks $b @()
+        Invoke-Sync $root $state
+        (Get-Tasks $a).Contains('t1') | Should -Be $true
+        (Get-Tasks $b).Contains('t1') | Should -Be $true
+    }
+
+    It 'takes the newest run state of a recurring task from any copy' {
+        $root = New-TaskFixture; $state = New-StateDir
+        $a = Join-Path $root 'devA/ws1'; $b = Join-Path $root 'devB/ws2'
+        $old = Get-Iso ($script:nowMs - 2 * $script:day); $new = Get-Iso ($script:nowMs - 3600000)
+        Set-Tasks $a @((New-Task 'r1' @{ cronExpression = '0 * * * *'; fireAt = $null; lastRunAt = $new; lastScheduledFor = $new }))
+        Set-Tasks $b @((New-Task 'r1' @{ cronExpression = '0 * * * *'; fireAt = $null; lastRunAt = $old; lastScheduledFor = $old; missedRunScanFloor = $new }))
+        Invoke-Sync $root $state
+        foreach ($ws in $a, $b) {
+            $t = (Get-Tasks $ws)['r1']
+            $t['lastRunAt'] | Should -Be $new
+            $t['lastScheduledFor'] | Should -Be $new
+            $t['missedRunScanFloor'] | Should -Be $new
+            $t['enabled'] | Should -Be $true
+        }
+    }
+
+    It 'merges concurrent edits field by field, and breaks a tie toward the account the app last ran on' {
+        $root = New-TaskFixture; $state = New-StateDir
+        $a = Join-Path $root 'devA/ws1'; $b = Join-Path $root 'devB/ws2'
+        Set-Tasks $a @((New-Task 'r1' @{ cronExpression = '0 9 * * *'; fireAt = $null }))
+        Set-Tasks $b @((New-Task 'r1' @{ cronExpression = '0 9 * * *'; fireAt = $null }))
+        Invoke-Sync $root $state
+        Set-Tasks $a @((New-Task 'r1' @{ cronExpression = '30 7 * * *'; fireAt = $null; displayName = 'from A' }))
+        Set-Tasks $b @((New-Task 'r1' @{ cronExpression = '0 9 * * *'; fireAt = $null; displayName = 'from B' }))
+        Invoke-Sync $root $state -AppConfig (New-AppConfig 'devB')
+        foreach ($ws in $a, $b) {
+            $t = (Get-Tasks $ws)['r1']
+            $t['displayName'] | Should -Be 'from B'                 # both changed it: the last-shown account wins
+            $t['cronExpression'] | Should -Be '30 7 * * *'          # only A changed it: A's edit propagates
+        }
+    }
+
+    It 'propagates a deliberate disable once a base exists (the first-run preference for live copies is first-run only)' {
+        $root = New-TaskFixture; $state = New-StateDir
+        $a = Join-Path $root 'devA/ws1'; $b = Join-Path $root 'devB/ws2'
+        Set-Tasks $a @((New-Task 't1'))
+        Set-Tasks $b @((New-Task 't1'))
+        Invoke-Sync $root $state
+        Set-Tasks $b @((New-Task 't1' @{ enabled = $false }))
+        Invoke-Sync $root $state -AppConfig (New-AppConfig 'devA')
+        (Get-Tasks $a)['t1']['enabled'] | Should -Be $false
+        (Get-Tasks $a)['t1'].Contains('lastRunAt') | Should -Be $false
+        Invoke-Sync $root $state
+        (Get-Tasks $a)['t1']['enabled'] | Should -Be $false
+        (Get-Tasks $b)['t1']['enabled'] | Should -Be $false
+    }
+
+    It 'first run after a manual move: disabled future copies neither disable the live ones nor count as a run' {
+        $root = New-TaskFixture @('devOld/wsO', 'devNew/wsN'); $state = New-StateDir
+        $old = Join-Path $root 'devOld/wsO'; $new = Join-Path $root 'devNew/wsN'
+        New-Chat $old 'n1' | Out-Null
+        $created = $script:nowMs - 60000
+        $fire1 = $script:nowMs + 1 * $script:day; $fire2 = $script:nowMs + 20 * $script:day
+        Set-Tasks $old @(
+            (New-Task 'm1' @{ fireAt = $fire1; enabled = $false; createdAt = $script:nowMs - 5 * $script:day; notifySessionId = 'local_n1' }),
+            (New-Task 'm2' @{ fireAt = $fire2; enabled = $false; createdAt = $script:nowMs - 5 * $script:day; notifySessionId = 'local_n1' }))
+        Set-Tasks $new @((New-Task 'm1' @{ fireAt = $fire1; createdAt = $created }), (New-Task 'm2' @{ fireAt = $fire2; createdAt = $created }))
+        $cfg = New-AppConfig 'devNew'
+        $newBefore = Get-TaskText $new
+        # As it happens for real: the app is open on the new account.
+        Invoke-Sync $root $state -AppState running -AppConfig $cfg
+        Get-TaskText $new | Should -Be $newBefore
+        foreach ($id in 'm1', 'm2') {
+            $t = (Get-Tasks $old)[$id]
+            $t['enabled'] | Should -Be $true
+            $t['createdAt'] | Should -Be $created
+            $t.Contains('lastRunAt') | Should -Be $false
+            $t['notifySessionId'] | Should -Be 'local_n1'
+        }
+        # The app closes: the new account catches up, still live, still unrun.
+        Invoke-Sync $root $state -AppState closed -AppConfig $cfg
+        foreach ($ws in $old, $new) {
+            foreach ($id in 'm1', 'm2') {
+                $t = (Get-Tasks $ws)[$id]
+                $t['enabled'] | Should -Be $true
+                $t.Contains('lastRunAt') | Should -Be $false
+            }
+        }
+        (Get-Tasks $new)['m1']['notifySessionId'] | Should -Be 'local_n1'
+    }
+
+    It 'enables a one-time task about to fire in one account only, and lifts the hold when it is rescheduled' {
+        $root = New-TaskFixture; $state = New-StateDir
+        $a = Join-Path $root 'devA/ws1'; $b = Join-Path $root 'devB/ws2'
+        $cfg = New-AppConfig 'devA'
+        $soon = $script:nowMs + 5 * 60000
+        Set-Tasks $a @((New-Task 'h1' @{ fireAt = $soon }))
+        Set-Tasks $b @((New-Task 'h1' @{ fireAt = $soon }))
+        Invoke-Sync $root $state -AppConfig $cfg
+        (Get-Tasks $a)['h1']['enabled'] | Should -Be $true
+        (Get-Tasks $b)['h1']['enabled'] | Should -Be $false
+        # A fires it; the run reaches B, which never becomes due.
+        $ran = Get-Iso ($soon + 1000)
+        Set-Tasks $a @((New-Task 'h1' @{ fireAt = $soon; enabled = $false; lastRunAt = $ran }))
+        Invoke-Sync $root $state -AppConfig $cfg
+        (Get-Tasks $b)['h1']['enabled'] | Should -Be $false
+        (Get-Tasks $b)['h1']['lastRunAt'] | Should -Be $ran
+        # Rescheduled far out in A (the app clears lastRunAt): live everywhere again.
+        $later = $script:nowMs + 10 * $script:day
+        Set-Tasks $a @((New-Task 'h1' @{ fireAt = $later; enabled = $true }))
+        Invoke-Sync $root $state -AppConfig $cfg
+        foreach ($ws in $a, $b) {
+            $t = (Get-Tasks $ws)['h1']
+            $t['enabled'] | Should -Be $true
+            $t['fireAt'] | Should -Be $later
+            $t.Contains('lastRunAt') | Should -Be $false
+        }
+    }
+
+    It 'while the app runs, never writes the running account and still updates the others' {
+        $root = New-TaskFixture; $state = New-StateDir
+        $a = Join-Path $root 'devA/ws1'; $b = Join-Path $root 'devB/ws2'
+        Set-Tasks $a @((New-Task 't1'))
+        Set-Tasks $b @((New-Task 't2'))
+        $aBefore = Get-TaskText $a
+        Invoke-Sync $root $state -AppState running -AppConfig (New-AppConfig 'devA')
+        Get-TaskText $a | Should -Be $aBefore
+        Get-TaskIds $b | Should -Be @('t1', 't2')
+        Get-Heartbeat $state | Should -Match 'tasks updated$'
+        (Get-Content (Join-Path $state 'sync-log.txt') -Raw) | Should -Match 'devA/ws1 is the account the app runs on'
+        # Nothing left to write but A's catch-up: deferred, not success.
+        Invoke-Sync $root $state -AppState running -AppConfig (New-AppConfig 'devA')
+        Get-Heartbeat $state | Should -Match 'tasks deferred$'
+        Get-TaskText $a | Should -Be $aBefore
+    }
+
+    It 'defers, writing nothing, when the app runs on an account it cannot identify' {
+        $root = New-TaskFixture; $state = New-StateDir
+        $a = Join-Path $root 'devA/ws1'; $b = Join-Path $root 'devB/ws2'
+        Set-Tasks $a @((New-Task 't1'))
+        Set-Tasks $b @((New-Task 't2'))
+        $aBefore = Get-TaskText $a; $bBefore = Get-TaskText $b
+        Invoke-Sync $root $state -AppState running
+        Get-Heartbeat $state | Should -Match 'tasks deferred$'
+        Get-TaskText $a | Should -Be $aBefore
+        Get-TaskText $b | Should -Be $bBefore
+        Join-Path $state 'tasks-base.json' | Should -Not -Exist
+    }
+
+    It 'defers, writing nothing, while a task file is locked, and merges once it is free' {
+        $root = New-TaskFixture; $state = New-StateDir
+        $a = Join-Path $root 'devA/ws1'; $b = Join-Path $root 'devB/ws2'
+        Set-Tasks $a @((New-Task 't1'))
+        Set-Tasks $b @((New-Task 't2'))
+        $aBefore = Get-TaskText $a
+        $lock = [System.IO.File]::Open((Join-Path $b 'scheduled-tasks.json'), 'Open', 'ReadWrite', 'None')
+        try { Invoke-Sync $root $state } finally { $lock.Dispose() }
+        Get-Heartbeat $state | Should -Match 'tasks deferred$'
+        Get-TaskText $a | Should -Be $aBefore
+        @(Get-ChildItem $b -Filter '*.cs-tmp-*').Count | Should -Be 0
+        Invoke-Sync $root $state
+        Get-Heartbeat $state | Should -Match 'tasks updated$'
+        Get-TaskIds $a | Should -Be @('t1', 't2')
+    }
+
+    It 'keeps runRetries and the stamped markers per file, drops a notification target whose chat is absent, and -WhatIf writes nothing' {
+        $root = New-TaskFixture; $state = New-StateDir
+        $a = Join-Path $root 'devA/ws1'; $b = Join-Path $root 'devB/ws2'
+        $retry = New-OrdinalDict; $slot = New-OrdinalDict
+        $slot['slot'] = Get-Iso $script:nowMs; $slot['attempts'] = 1; $slot['notBefore'] = $null
+        $retry['t1'] = $slot
+        Set-Tasks $a @((New-Task 't1' @{ notifySessionId = 'local_missing' })) @{ runRetries = $retry; dayFieldsOrBoundaryStamped = $true }
+        Set-Tasks $b @() @{ sundayAliasBoundaryStamped = $null }
+        $bBefore = Get-TaskText $b
+        $out = Invoke-Sync $root $state -WhatIf -Loud 6>&1
+        # Under -WhatIf the log is a previewed write too: read the console.
+        ($out | Out-String) | Should -Match 'tasks would be merged'
+        ($out | Out-String) | Should -Match 'tasks would-update'
+        Get-TaskText $b | Should -Be $bBefore
+        Join-Path $state 'tasks-base.json' | Should -Not -Exist
+        Invoke-Sync $root $state
+        $docB = Get-TaskDoc $b
+        (Get-TaskMap $docB)['t1'].Contains('notifySessionId') | Should -Be $false
+        $docB.Contains('runRetries') | Should -Be $false
+        $docB.Contains('dayFieldsOrBoundaryStamped') | Should -Be $false
+        $docB.Contains('sundayAliasBoundaryStamped') | Should -Be $false
+        (Get-TaskDoc $a)['runRetries'].Contains('t1') | Should -Be $true
+    }
+
+    It 'round-trips the app file byte for byte, non-ASCII names included' {
+        $text = "{`n  `"scheduledTasks`": [`n    {`n      `"id`": `"x`",`n      `"displayName`": `"n" + [char]0xE6 + "vn \`"q\`"`",`n      `"fireAt`": 1790928000000,`n      `"enabled`": true,`n      `"lastRunAt`": `"2026-09-29T20:00:00.000Z`"`n    }`n  ],`n  `"recordedSkips`": {}`n}"
+        ConvertTo-TaskJson (ConvertFrom-TaskJson $text) | Should -BeExactly $text
+        (ConvertFrom-TaskJson $text)['scheduledTasks'][0]['lastRunAt'] | Should -BeOfType [string]
     }
 }

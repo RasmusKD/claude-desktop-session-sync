@@ -26,7 +26,7 @@ foreach ($path in @('\', $SyncTaskPath)) {
 }
 if (-not $removed) { Write-Host "No '$SyncTaskName' task of ours found." }
 
-foreach ($f in @($SyncLauncher, $SyncScriptInstalled, $SyncCommonInstalled)) {
+foreach ($f in @($SyncLauncher, $SyncScriptInstalled, $SyncCommonInstalled, (Join-Path $SyncInstallDir 'task-sync.ps1'))) {
     if (Test-Path $f) { Remove-Item $f -Force; Write-Host "Removed $f" }
 }
 if (Test-Path $SyncGroupHelperDir) { Remove-Item $SyncGroupHelperDir -Recurse -Force; Write-Host "Removed $SyncGroupHelperDir" }
@@ -41,6 +41,8 @@ foreach ($stale in Get-StaleInstallShadows) {
 if (Test-Path $SyncManifestFile) { Remove-Item $SyncManifestFile -Force; Write-Host 'Removed the sync manifest (derived state; rebuilt on reinstall).' }
 $groupsBase = Join-Path $SyncInstallDir 'groups-base.json'
 if (Test-Path $groupsBase) { Remove-Item $groupsBase -Force; Write-Host 'Removed the group-sync base (derived state; the first run after a reinstall merges without deletions).' }
+$tasksBase = Join-Path $SyncInstallDir 'tasks-base.json'
+if (Test-Path $tasksBase) { Remove-Item $tasksBase -Force; Write-Host 'Removed the scheduled-task base (derived state; the first run after a reinstall merges without deletions).' }
 
 if ($Purge) {
     Remove-Item $SyncInstallDir -Recurse -Force -ErrorAction SilentlyContinue
@@ -50,11 +52,13 @@ if ($Purge) {
     $cfgs   = @(Get-ChildItem $SyncInstallDir -Filter 'config-*.json' -ErrorAction SilentlyContinue).Count
     $ldbs   = @(Get-ChildItem $SyncInstallDir -Filter 'leveldb-backup-*' -Directory -ErrorAction SilentlyContinue).Count
     $stash  = @(Get-ChildItem (Join-Path $SyncInstallDir 'deleted') -File -ErrorAction SilentlyContinue).Count
+    $tbaks  = @(Get-ChildItem $SyncInstallDir -Filter 'tasks-backup-*' -Directory -ErrorAction SilentlyContinue).Count
     Write-Host "Kept in ${SyncInstallDir}:"
     Write-Host "  - $zips session backup zip(s)"
     Write-Host "  - $cfgs claude_desktop_config.json cop(ies) - these can contain MCP API keys"
     Write-Host "  - $ldbs Local Storage snapshot(s) taken before group writes - these hold the app's per-account browser storage"
     Write-Host "  - $stash stashed deleted chat(s)"
+    Write-Host "  - $tbaks scheduled-task file snapshot(s) taken before task writes"
     Write-Host "  - sync-log.txt and frozen.txt (the freeze list survives reinstalls by design)"
     Write-Host "Run 'uninstall.ps1 -Purge' to delete all of it."
 }
